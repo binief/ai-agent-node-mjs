@@ -1534,6 +1534,7 @@ async function agentTurn(cfg, history, keys) {
     }
     if (!tcs.length) { // final message → done (1 round trip)
       history.push({ role: "assistant", content: result.content || "" });
+      if (result.usage) showStats(cfg, history, result.usage);
       return;
     }
 
