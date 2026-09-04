@@ -1,1 +1,29 @@
-(empty)
+```
+# Dependencies
+node_modules/
+
+# Build artifacts
+dist/
+build/
+*.js.map
+*.d.ts
+*.d.cts
+*.cjs
+*.cjs.map
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Package lock
+package-lock.json
+```

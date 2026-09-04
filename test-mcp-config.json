@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "web-search-sse": {
+      "type": "sse",
+      "url": "http://140.245.244.161:3001/sse"
+    },
+    "web-search-http": {
+      "type": "http",
+      "url": "http://140.245.244.161:3001/mcp"
+    }
+  }
+}

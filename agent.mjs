@@ -35,6 +35,7 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import { exec, spawn } from "node:child_process";
 import process from "node:process";
+import { EventSource } from "eventsource";
 
 const VERSION = "2.9.0";
 
@@ -490,18 +491,96 @@ class McpClient {
     this.name = name; this.cfg = cfg;
     this.proc = null; this.buf = ""; this.nextId = 1;
     this.pending = new Map(); this.tools = [];
+    this.transport = cfg.type || "stdio";
+    this.httpSession = null;
+    this.sseSource = null;
+    this.sseEndpoint = null;
   }
   start() {
-    this.proc = spawn(this.cfg.command, this.cfg.args || [], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, ...(this.cfg.env || {}) },
-      windowsHide: true,
+    if (this.transport === "stdio") {
+      this.proc = spawn(this.cfg.command, this.cfg.args || [], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, ...(this.cfg.env || {}) },
+        windowsHide: true,
+      });
+      this.proc.stdout.setEncoding("utf8");
+      this.proc.stdout.on("data", d => this._onData(d));
+      this.proc.stderr.on("data", () => {});
+      this.proc.on("error", e => this._failAll(e));
+      this.proc.on("exit", c => this._failAll(new Error(`server exited (${c})`)));
+    } else if (this.transport === "sse" || this.transport === "http") {
+      // SSE/HTTP transport - will connect via HTTP POST after SSE handshake
+      this._connectHttp();
+    }
+  }
+  async _connectHttp() {
+    const url = new URL(this.cfg.url);
+    // For SSE, we need to establish an SSE connection first to get the endpoint
+    if (this.transport === "sse") {
+      await this._establishSse(url.toString());
+    } else {
+      // Direct HTTP - use the URL as-is for tool calls
+      this.sseEndpoint = url.toString();
+      this._onReady();
+    }
+  }
+  async _establishSse(baseUrl) {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        if (this.sseSource) this.sseSource.close();
+        reject(new Error("SSE connection timeout"));
+      }, 30000);
+      
+      const sseUrl = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/";
+      this.sseSource = new EventSource(sseUrl);
+      
+      this.sseSource.onerror = () => {
+        clearTimeout(timeout);
+        this.sseSource.close();
+        reject(new Error("SSE connection failed"));
+      };
+      
+      this.sseSource.addEventListener("endpoint", (e) => {
+        clearTimeout(timeout);
+        try {
+          const data = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
+          this.sseEndpoint = typeof data === "string" ? data : data.endpoint;
+          if (!this.sseEndpoint.startsWith("http")) {
+            this.sseEndpoint = new URL(this.sseEndpoint, baseUrl).toString();
+          }
+          this.sseSource.close();
+          this._onReady();
+          resolve();
+        } catch (err) {
+          clearTimeout(timeout);
+          this.sseSource.close();
+          reject(err);
+        }
+      });
+      
+      this.sseSource.onopen = () => {
+        // Some servers send endpoint immediately on open
+      };
     });
-    this.proc.stdout.setEncoding("utf8");
-    this.proc.stdout.on("data", d => this._onData(d));
-    this.proc.stderr.on("data", () => {});
-    this.proc.on("error", e => this._failAll(e));
-    this.proc.on("exit", c => this._failAll(new Error(`server exited (${c})`)));
+  }
+  _onReady() {
+    // HTTP/SSE transport ready, now initialize
+    this.initialize().then(() => {
+      this.listTools().then(tools => {
+        mcpClients.set(this.name, this);
+        for (const t of tools) {
+          let exposed = t.name;
+          if (TOOLS.some(x => x.function.name === exposed) || mcpRegistry.has(exposed))
+            exposed = `${this.name}__${t.name}`;
+          mcpRegistry.set(exposed, { client: this, realName: t.name, schema: t });
+        }
+        console.log(dim(`✓ MCP '${this.name}' connected (${tools.length} tools)`));
+      }).catch(e => {
+        console.log(yellow(`! MCP server '${this.name}' tool list failed: ${e.message}`));
+      });
+    }).catch(e => {
+      console.log(yellow(`! MCP server '${this.name}' initialize failed: ${e.message}`));
+    });
   }
   _onData(chunk) {
     this.buf += chunk;
@@ -518,7 +597,41 @@ class McpClient {
       }
     }
   }
-  _send(msg) { try { this.proc.stdin.write(JSON.stringify(msg) + "\n"); } catch {} }
+  _send(msg) {
+    if (this.transport === "stdio") {
+      try { this.proc.stdin.write(JSON.stringify(msg) + "\n"); } catch {}
+    } else if (this.transport === "sse" || this.transport === "http") {
+      this._sendHttp(msg);
+    }
+  }
+  async _sendHttp(msg) {
+    if (!this.sseEndpoint) {
+      // Not yet connected
+      return;
+    }
+    try {
+      const res = await fetch(this.sseEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(msg),
+      });
+      const data = await res.json();
+      if (data.id !== undefined && this.pending.has(data.id)) {
+        const { resolve, reject } = this.pending.get(data.id);
+        this.pending.delete(data.id);
+        data.error ? reject(new Error(data.error.message || "MCP error")) : resolve(data.result);
+      }
+    } catch (e) {
+      // Find pending request and reject
+      for (const [id, { reject }] of this.pending) {
+        if (id === msg.id) {
+          this.pending.delete(id);
+          reject(e);
+          break;
+        }
+      }
+    }
+  }
   request(method, params, timeoutMs = 30000) {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
@@ -537,7 +650,12 @@ class McpClient {
       capabilities: {},
       clientInfo: { name: "ai-agent", version: VERSION },
     });
-    this._send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    if (this.transport === "stdio") {
+      this._send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    } else {
+      // For HTTP/SSE, send initialized notification too
+      this._send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    }
   }
   async listTools() { this.tools = (await this.request("tools/list", {})).tools || []; return this.tools; }
   async callTool(name, args, timeoutMs) {
@@ -546,7 +664,13 @@ class McpClient {
       c.type === "text" ? c.text : `[${c.type}] ` + JSON.stringify(c));
     return [!res.isError, parts.join("\n") || "[no output]"];
   }
-  stop() { try { this.proc?.kill(); } catch {} }
+  stop() {
+    if (this.transport === "stdio") {
+      try { this.proc?.kill(); } catch {}
+    } else if (this.transport === "sse" || this.transport === "http") {
+      try { this.sseSource?.close(); } catch {}
+    }
+  }
   _failAll(err) { for (const [, { reject }] of this.pending) reject(err); this.pending.clear(); }
 }
 
@@ -556,16 +680,21 @@ async function connectMcp() {
     const client = new McpClient(sname, scfg);
     try {
       client.start();
-      await client.initialize();
-      const tools = await client.listTools();
-      mcpClients.set(sname, client);
-      for (const t of tools) {
-        let exposed = t.name;
-        if (TOOLS.some(x => x.function.name === exposed) || mcpRegistry.has(exposed))
-          exposed = `${sname}__${t.name}`;
-        mcpRegistry.set(exposed, { client, realName: t.name, schema: t });
+      // For stdio transport, initialize and list tools synchronously
+      // For SSE/HTTP, initialization happens asynchronously in _onReady()
+      if (client.transport === "stdio") {
+        await client.initialize();
+        const tools = await client.listTools();
+        mcpClients.set(sname, client);
+        for (const t of tools) {
+          let exposed = t.name;
+          if (TOOLS.some(x => x.function.name === exposed) || mcpRegistry.has(exposed))
+            exposed = `${sname}__${t.name}`;
+          mcpRegistry.set(exposed, { client, realName: t.name, schema: t });
+        }
+        console.log(dim(`✓ MCP '${sname}' connected (${tools.length} tools)`));
       }
-      console.log(dim(`✓ MCP '${sname}' connected (${tools.length} tools)`));
+      // For SSE/HTTP, the connection is handled asynchronously in _onReady()
     } catch (e) {
       console.log(yellow(`! MCP server '${sname}' failed: ${e.message}`));
       client.stop();
