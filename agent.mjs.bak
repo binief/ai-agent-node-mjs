@@ -35,6 +35,7 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import { exec, spawn } from "node:child_process";
 import process from "node:process";
+import { EventSource } from "eventsource";
 
 const VERSION = "2.9.0";
 
@@ -177,6 +178,8 @@ commands
   /set max_steps <n>      tool-step cap (0 = unlimited; default)
   /set intercept <on|off> approval gate before mutating tools run
   /set system <prompt>    replace system prompt
+  /mode <ask|plan|code>   agent mode (ask=chat, plan=read-only plan, code=full auto)
+  /redact <on|off>        toggle silent secret redaction (default: on)
   /compact                summarize & shrink history (use when context is getting full)
   /block <regex>  /unblock <regex>  /blocked     manage command blocklist
   /mcp                    list connected MCP servers and their tools
@@ -201,6 +204,7 @@ usage: node ai-agent.mjs [options] ["one-shot prompt"]
   --draft-model <name>  speculative-decoding draft model
   --temperature <n>     sampling temperature
   --reasoning <lvl>     reasoning effort (low|medium|high)
+  --mode <ask|plan|code> agent mode (default: code)
   --dir <path>        project folder all tasks are based on
   --context <n>       --maxout <n>        --max-tokens <n>
   --max-steps <n>     tool-step cap (0 = unlimited; default)
@@ -487,18 +491,96 @@ class McpClient {
     this.name = name; this.cfg = cfg;
     this.proc = null; this.buf = ""; this.nextId = 1;
     this.pending = new Map(); this.tools = [];
+    this.transport = cfg.type || "stdio";
+    this.httpSession = null;
+    this.sseSource = null;
+    this.sseEndpoint = null;
   }
   start() {
-    this.proc = spawn(this.cfg.command, this.cfg.args || [], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, ...(this.cfg.env || {}) },
-      windowsHide: true,
+    if (this.transport === "stdio") {
+      this.proc = spawn(this.cfg.command, this.cfg.args || [], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, ...(this.cfg.env || {}) },
+        windowsHide: true,
+      });
+      this.proc.stdout.setEncoding("utf8");
+      this.proc.stdout.on("data", d => this._onData(d));
+      this.proc.stderr.on("data", () => {});
+      this.proc.on("error", e => this._failAll(e));
+      this.proc.on("exit", c => this._failAll(new Error(`server exited (${c})`)));
+    } else if (this.transport === "sse" || this.transport === "http") {
+      // SSE/HTTP transport - will connect via HTTP POST after SSE handshake
+      this._connectHttp();
+    }
+  }
+  async _connectHttp() {
+    const url = new URL(this.cfg.url);
+    // For SSE, we need to establish an SSE connection first to get the endpoint
+    if (this.transport === "sse") {
+      await this._establishSse(url.toString());
+    } else {
+      // Direct HTTP - use the URL as-is for tool calls
+      this.sseEndpoint = url.toString();
+      this._onReady();
+    }
+  }
+  async _establishSse(baseUrl) {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        if (this.sseSource) this.sseSource.close();
+        reject(new Error("SSE connection timeout"));
+      }, 30000);
+      
+      const sseUrl = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/";
+      this.sseSource = new EventSource(sseUrl);
+      
+      this.sseSource.onerror = () => {
+        clearTimeout(timeout);
+        this.sseSource.close();
+        reject(new Error("SSE connection failed"));
+      };
+      
+      this.sseSource.addEventListener("endpoint", (e) => {
+        clearTimeout(timeout);
+        try {
+          const data = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
+          this.sseEndpoint = typeof data === "string" ? data : data.endpoint;
+          if (!this.sseEndpoint.startsWith("http")) {
+            this.sseEndpoint = new URL(this.sseEndpoint, baseUrl).toString();
+          }
+          this.sseSource.close();
+          this._onReady();
+          resolve();
+        } catch (err) {
+          clearTimeout(timeout);
+          this.sseSource.close();
+          reject(err);
+        }
+      });
+      
+      this.sseSource.onopen = () => {
+        // Some servers send endpoint immediately on open
+      };
     });
-    this.proc.stdout.setEncoding("utf8");
-    this.proc.stdout.on("data", d => this._onData(d));
-    this.proc.stderr.on("data", () => {});
-    this.proc.on("error", e => this._failAll(e));
-    this.proc.on("exit", c => this._failAll(new Error(`server exited (${c})`)));
+  }
+  _onReady() {
+    // HTTP/SSE transport ready, now initialize
+    this.initialize().then(() => {
+      this.listTools().then(tools => {
+        mcpClients.set(this.name, this);
+        for (const t of tools) {
+          let exposed = t.name;
+          if (TOOLS.some(x => x.function.name === exposed) || mcpRegistry.has(exposed))
+            exposed = `${this.name}__${t.name}`;
+          mcpRegistry.set(exposed, { client: this, realName: t.name, schema: t });
+        }
+        console.log(dim(`✓ MCP '${this.name}' connected (${tools.length} tools)`));
+      }).catch(e => {
+        console.log(yellow(`! MCP server '${this.name}' tool list failed: ${e.message}`));
+      });
+    }).catch(e => {
+      console.log(yellow(`! MCP server '${this.name}' initialize failed: ${e.message}`));
+    });
   }
   _onData(chunk) {
     this.buf += chunk;
@@ -515,7 +597,41 @@ class McpClient {
       }
     }
   }
-  _send(msg) { try { this.proc.stdin.write(JSON.stringify(msg) + "\n"); } catch {} }
+  _send(msg) {
+    if (this.transport === "stdio") {
+      try { this.proc.stdin.write(JSON.stringify(msg) + "\n"); } catch {}
+    } else if (this.transport === "sse" || this.transport === "http") {
+      this._sendHttp(msg);
+    }
+  }
+  async _sendHttp(msg) {
+    if (!this.sseEndpoint) {
+      // Not yet connected
+      return;
+    }
+    try {
+      const res = await fetch(this.sseEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(msg),
+      });
+      const data = await res.json();
+      if (data.id !== undefined && this.pending.has(data.id)) {
+        const { resolve, reject } = this.pending.get(data.id);
+        this.pending.delete(data.id);
+        data.error ? reject(new Error(data.error.message || "MCP error")) : resolve(data.result);
+      }
+    } catch (e) {
+      // Find pending request and reject
+      for (const [id, { reject }] of this.pending) {
+        if (id === msg.id) {
+          this.pending.delete(id);
+          reject(e);
+          break;
+        }
+      }
+    }
+  }
   request(method, params, timeoutMs = 30000) {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
@@ -534,7 +650,12 @@ class McpClient {
       capabilities: {},
       clientInfo: { name: "ai-agent", version: VERSION },
     });
-    this._send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    if (this.transport === "stdio") {
+      this._send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    } else {
+      // For HTTP/SSE, send initialized notification too
+      this._send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    }
   }
   async listTools() { this.tools = (await this.request("tools/list", {})).tools || []; return this.tools; }
   async callTool(name, args, timeoutMs) {
@@ -543,7 +664,13 @@ class McpClient {
       c.type === "text" ? c.text : `[${c.type}] ` + JSON.stringify(c));
     return [!res.isError, parts.join("\n") || "[no output]"];
   }
-  stop() { try { this.proc?.kill(); } catch {} }
+  stop() {
+    if (this.transport === "stdio") {
+      try { this.proc?.kill(); } catch {}
+    } else if (this.transport === "sse" || this.transport === "http") {
+      try { this.sseSource?.close(); } catch {}
+    }
+  }
   _failAll(err) { for (const [, { reject }] of this.pending) reject(err); this.pending.clear(); }
 }
 
@@ -553,16 +680,21 @@ async function connectMcp() {
     const client = new McpClient(sname, scfg);
     try {
       client.start();
-      await client.initialize();
-      const tools = await client.listTools();
-      mcpClients.set(sname, client);
-      for (const t of tools) {
-        let exposed = t.name;
-        if (TOOLS.some(x => x.function.name === exposed) || mcpRegistry.has(exposed))
-          exposed = `${sname}__${t.name}`;
-        mcpRegistry.set(exposed, { client, realName: t.name, schema: t });
+      // For stdio transport, initialize and list tools synchronously
+      // For SSE/HTTP, initialization happens asynchronously in _onReady()
+      if (client.transport === "stdio") {
+        await client.initialize();
+        const tools = await client.listTools();
+        mcpClients.set(sname, client);
+        for (const t of tools) {
+          let exposed = t.name;
+          if (TOOLS.some(x => x.function.name === exposed) || mcpRegistry.has(exposed))
+            exposed = `${sname}__${t.name}`;
+          mcpRegistry.set(exposed, { client, realName: t.name, schema: t });
+        }
+        console.log(dim(`✓ MCP '${sname}' connected (${tools.length} tools)`));
       }
-      console.log(dim(`✓ MCP '${sname}' connected (${tools.length} tools)`));
+      // For SSE/HTTP, the connection is handled asynchronously in _onReady()
     } catch (e) {
       console.log(yellow(`! MCP server '${sname}' failed: ${e.message}`));
       client.stop();
@@ -590,7 +722,7 @@ function loadCfg() {
                 intercept: false, autoYes: false, maxSteps: 0,
                 blockedCommands: DEFAULT_BLOCKED,
                 draftModel: "", temperature: null,
-                reasoning: "", redact: true };
+                reasoning: "", redact: true, mode: "code" };
   try { Object.assign(cfg, JSON.parse(fs.readFileSync(CFG_PATH, "utf8"))); } catch {}
   return cfg;
 }
@@ -600,7 +732,14 @@ function saveCfg(cfg) {
 // NOTE: intentionally says NOTHING about secret masking — the model must never
 // learn that values are substituted. Round-tripping handles it transparently.
 const systemPrompt = (cfg, userPrompt = "") => {
-  let s = cfg.system || SYS_PROMPT;
+  let s = "";
+  if (cfg.mode === "ask") {
+    s = "You are an expert AI assistant. The user is in ASK mode. Answer questions directly and conversationally. Do NOT use any tools, do NOT read or write files, and do NOT execute commands. Just provide helpful text responses.";
+  } else if (cfg.mode === "plan") {
+    s = "You are an expert autonomous software-engineering agent. The user is in PLAN mode. Your goal is to analyze the project and create a detailed, step-by-step plan to solve the user's task. You may use read-only tools (like read_file and shell for searching) to gather context, but DO NOT write, edit, or execute any mutating commands. Output a clear, actionable plan.";
+  } else {
+    s = cfg.system || SYS_PROMPT;
+  }
   s += `\nOperating system: ${osDescription()} · shell: ${SHELL_NAME}. Use ONLY commands valid for this OS and shell.`;
   s += commandHints();
   const blocked = cfg.blockedCommands || DEFAULT_BLOCKED;
@@ -1419,6 +1558,8 @@ function stripToolMarkup(t) {
 async function agentTurn(cfg, history, keys) {
   if (cfg.tools) await ensureMcp();
   let tools = cfg.tools ? allTools() : [];
+  if (cfg.mode === "ask") tools = [];
+  else if (cfg.mode === "plan") tools = tools.filter(t => ["read_file", "shell"].includes(t.function.name));
   const lastUserMsg = [...history].reverse().find(m => m.role === "user")?.content || "";
   if (history[0]?.role === "system") history[0].content = systemPrompt(cfg, lastUserMsg);
 
@@ -1522,6 +1663,7 @@ async function agentTurn(cfg, history, keys) {
     }
     if (!tcs.length) { // final message → done (1 round trip)
       history.push({ role: "assistant", content: result.content || "" });
+      if (result.usage) showStats(cfg, history, result.usage);
       return;
     }
 
@@ -1991,12 +2133,34 @@ async function handleCommand(line, cfg, history, keys) {
       }
       break;
     }
+    case "/mode": {
+    const m = (k || "").toLowerCase();
+    if (!["code", "ask", "plan"].includes(m)) {
+      console.log(dim("usage: /mode <code|ask|plan>"));
+    } else {
+      cfg.mode = m;
+      saveCfg(cfg);
+      if (history.length) history[0].content = systemPrompt(cfg);
+      console.log(dim("✓ mode set to " + m));
+    }
+    break;
+    }
+    case "/redact": {
+    const val = (k || "").toLowerCase();
+    if (["on", "true", "1"].includes(val)) cfg.redact = true;
+    else if (["off", "false", "0"].includes(val)) cfg.redact = false;
+    else { console.log(dim("usage: /redact <on|off>")); break; }
+    saveCfg(cfg);
+    console.log(dim("✓ redact " + (cfg.redact ? "on" : "off")));
+    break;
+    }
     case "/config": {
       const key = cfg.apiKey || "";
       const masked = key.length > 12 ? key.slice(0, 7) + "…" + key.slice(-4) : (key ? "set" : "—");
       console.log(`  url      ${cfg.apiUrl}\n  model    ${cfg.model}\n  key      ${masked}` +
         `\n  draft    ${cfg.draftModel || "—"}\n  temp     ${cfg.temperature == null ? "default" : cfg.temperature}` +
-        `\n  reasoning ${cfg.reasoning || "default"}` +
+        `\n  reasoning ${cfg.reasoning || "default"}
+        mode     ${cfg.mode || "code"}` +
         `\n  dir      ${cfg.projectDir ? displayPath(cfg.projectDir) : "(process cwd: " + displayPath(process.cwd()) + ")"}` +
         `\n  context  ${cfg.context || "not set (no trimming)"}\n  maxout   ${cfg.maxout}` +
         `   max_tokens ${cfg.maxTokens || "default"}\n  intercept ${cfg.intercept ? "on" : "off"}` +
@@ -2017,6 +2181,16 @@ async function handleCommand(line, cfg, history, keys) {
         else if (k === "reasoning") {
           if (!v || v === "off" || v === "none") cfg.reasoning = "";
           else cfg.reasoning = v;
+        }
+        else if (k === "mode") {
+        const m = (v || "").toLowerCase();
+        if (["code", "ask", "plan"].includes(m)) {
+          cfg.mode = m;
+          if (history.length) history[0].content = systemPrompt(cfg);
+        } else {
+          console.log(dim("usage: /set mode <code|ask|plan>"));
+          return true;
+        }
         }
         else if (k === "redact") cfg.redact = ["on","true","1"].includes(v);
         else if (k === "dir") {
@@ -2039,7 +2213,7 @@ async function handleCommand(line, cfg, history, keys) {
         else if (k === "intercept") cfg.intercept = ["on","true","1"].includes(v);
         else if (k === "max_steps") cfg.maxSteps = v ? parseInt(v, 10) : 0;
         else if (k === "system" && v) { cfg.system = v; if (history.length) history[0].content = systemPrompt(cfg); }
-        else { console.log(dim("usage: /set url|model|key|draft_model|temperature|reasoning|redact|dir|context|max_tokens|maxout|intercept|max_steps|system <value>")); return true; }
+        else { console.log(dim("usage: /set url|model|key|draft_model|temperature|reasoning|mode|redact|dir|context|max_tokens|maxout|intercept|max_steps|system <value>")); return true; }
         saveCfg(cfg);
         console.log(dim(`✓ ${k} updated`));
       } catch (e) { console.log(red(String(e.message))); }
@@ -2064,7 +2238,8 @@ async function handleCommand(line, cfg, history, keys) {
 
 function banner(cfg) {
   const dir = cfg.projectDir ? displayPath(cfg.projectDir) : displayPath(process.cwd());
-  console.log(bold("◆ ai-agent") + dim(`  ${cfg.model} @ ${cfg.apiUrl}  ·  ${osDescription()}  ·  ctx ${cfg.context ? fmtK(cfg.context) : "unknown"}  ·  key ${cfg.apiKey ? "✓" : "—"}` + (cfg.draftModel ? `  ·  draft ${cfg.draftModel}` : "") + (cfg.temperature != null ? `  ·  temp ${cfg.temperature}` : "") + (cfg.reasoning ? `  ·  reasoning ${cfg.reasoning}` : "") + (cfg.intercept ? "  ·  🔒 intercept" : "")));
+  const modeStr = cfg.mode && cfg.mode !== "code" ? "  ·  mode " + cfg.mode : "";
+  console.log(bold("◆ ai-agent") + dim(`  ${cfg.model} @ ${cfg.apiUrl}  ·  ${osDescription()}  ·  ctx ${cfg.context ? fmtK(cfg.context) : "unknown"}  ·  key ${cfg.apiKey ? "✓" : "—"}` + (cfg.draftModel ? `  ·  draft ${cfg.draftModel}` : "") + (cfg.temperature != null ? `  ·  temp ${cfg.temperature}` : "") + (cfg.reasoning ? `  ·  reasoning ${cfg.reasoning}` : "") + (cfg.intercept ? "  ·  🔒 intercept" : "") + modeStr));
   console.log(dim(`  📁 ${dir}   ·   data: ${DATA_DIR}`));
   console.log(dim("  enter send · shift+enter newline (or \\+enter) · @file+Tab complete · ^C cancel · ^D exit · /help"));
 }
@@ -2087,6 +2262,7 @@ function parseArgs(argv) {
       case "--draft-model": a.draftModel = next(); break;
       case "--temperature": a.temperature = parseFloat(next()); break;
       case "--reasoning": a.reasoning = next(); break;
+      case "--mode": a.mode = next(); break;
       case "--intercept": case "-i": a.intercept = true; break;
       case "--no-tools": a.noTools = true; break;
       case "--list": a.list = true; break;
@@ -2123,6 +2299,7 @@ async function main() {
   if (args.draftModel) cfg.draftModel = args.draftModel;
   if (typeof args.temperature === "number" && !isNaN(args.temperature)) cfg.temperature = args.temperature;
   if (args.reasoning) cfg.reasoning = args.reasoning;
+  if (args.mode) cfg.mode = args.mode;
   if (args.save) saveCfg(cfg);
 
   if (args.list) {

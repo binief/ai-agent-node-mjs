@@ -332,8 +332,22 @@ const DEFAULT_BLOCKED = [
   "^\\s*powershell(\\.exe)?(\\s|$)",
   "^\\s*pwsh(\\.exe)?(\\s|$)",
 ];
+const WEB_FETCH_SHELL = /\b(curl|wget|httpie|Invoke-WebRequest|\biwr\b|lynx|w3m)\b/i;
+function mcpSearchToolsListed() {
+  for (const name of mcpRegistry.keys()) {
+    if (/search|web_|web-|fetch|page-content|exa|brave|tavily/i.test(name)) return true;
+  }
+  return mcpRegistry.size > 0;
+}
 function checkCommandPolicy(cmd, cfg) {
   const c = String(cmd).trim();
+  if (mcpSearchToolsListed() && WEB_FETCH_SHELL.test(c)) {
+    const names = [...mcpRegistry.keys()].join(", ");
+    return {
+      allowed: false,
+      pattern: "curl/wget blocked — use MCP: " + names,
+    };
+  }
   for (const pat of (cfg.blockedCommands || DEFAULT_BLOCKED)) {
     let re; try { re = new RegExp(pat, "i"); } catch { continue; }
     if (re.test(c)) return { allowed: false, pattern: pat };
@@ -356,6 +370,7 @@ const READONLY = [
   /^(node|python3?)\s+--version\b/i,
 ];
 function classifyTool(name, args) {
+  if (mcpRegistry.has(name)) return "auto";
   if (name === "read_file") return "auto";
   if (name === "shell") {
     const c = String(args.command || args._raw || "").trim();
@@ -486,17 +501,34 @@ function loadMcpServers() {
   } catch { return {}; }
 }
 
+function mcpTransportOf(cfg) {
+  if (cfg.type) return cfg.type;
+  if (cfg.url) return "http";
+  return "stdio";
+}
+
+function parseSseJsonRpc(text) {
+  let last = null;
+  for (const line of String(text).split(/\r?\n/)) {
+    if (!line.startsWith("data:")) continue;
+    const raw = line.slice(5).trim();
+    if (!raw || raw === "[DONE]") continue;
+    try { last = JSON.parse(raw); } catch {}
+  }
+  return last;
+}
+
 class McpClient {
   constructor(name, cfg) {
     this.name = name; this.cfg = cfg;
     this.proc = null; this.buf = ""; this.nextId = 1;
     this.pending = new Map(); this.tools = [];
-    this.transport = cfg.type || "stdio";
+    this.transport = mcpTransportOf(cfg);
     this.httpSession = null;
     this.sseSource = null;
-    this.sseEndpoint = null;
+    this.sseEndpoint = cfg.url || null;
   }
-  start() {
+  async start() {
     if (this.transport === "stdio") {
       this.proc = spawn(this.cfg.command, this.cfg.args || [], {
         stdio: ["pipe", "pipe", "pipe"],
@@ -508,21 +540,11 @@ class McpClient {
       this.proc.stderr.on("data", () => {});
       this.proc.on("error", e => this._failAll(e));
       this.proc.on("exit", c => this._failAll(new Error(`server exited (${c})`)));
-    } else if (this.transport === "sse" || this.transport === "http") {
-      // SSE/HTTP transport - will connect via HTTP POST after SSE handshake
-      this._connectHttp();
+      return;
     }
-  }
-  async _connectHttp() {
-    const url = new URL(this.cfg.url);
-    // For SSE, we need to establish an SSE connection first to get the endpoint
-    if (this.transport === "sse") {
-      await this._establishSse(url.toString());
-    } else {
-      // Direct HTTP - use the URL as-is for tool calls
-      this.sseEndpoint = url.toString();
-      this._onReady();
-    }
+    if (!this.cfg.url) throw new Error("MCP http/sse server needs a url");
+    this.sseEndpoint = this.cfg.url;
+    if (this.transport === "sse") await this._establishSse(this.cfg.url);
   }
   async _establishSse(baseUrl) {
     return new Promise((resolve, reject) => {
@@ -530,56 +552,27 @@ class McpClient {
         if (this.sseSource) this.sseSource.close();
         reject(new Error("SSE connection timeout"));
       }, 30000);
-      
       const sseUrl = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/";
       this.sseSource = new EventSource(sseUrl);
-      
       this.sseSource.onerror = () => {
         clearTimeout(timeout);
         this.sseSource.close();
         reject(new Error("SSE connection failed"));
       };
-      
       this.sseSource.addEventListener("endpoint", (e) => {
         clearTimeout(timeout);
         try {
-          const data = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
-          this.sseEndpoint = typeof data === "string" ? data : data.endpoint;
+          const data = typeof e.data === "string" ? (() => { try { return JSON.parse(e.data); } catch { return e.data; } })() : e.data;
+          this.sseEndpoint = typeof data === "string" ? data : (data.endpoint || this.cfg.url);
           if (!this.sseEndpoint.startsWith("http")) {
             this.sseEndpoint = new URL(this.sseEndpoint, baseUrl).toString();
           }
-          this.sseSource.close();
-          this._onReady();
           resolve();
         } catch (err) {
-          clearTimeout(timeout);
           this.sseSource.close();
           reject(err);
         }
       });
-      
-      this.sseSource.onopen = () => {
-        // Some servers send endpoint immediately on open
-      };
-    });
-  }
-  _onReady() {
-    // HTTP/SSE transport ready, now initialize
-    this.initialize().then(() => {
-      this.listTools().then(tools => {
-        mcpClients.set(this.name, this);
-        for (const t of tools) {
-          let exposed = t.name;
-          if (TOOLS.some(x => x.function.name === exposed) || mcpRegistry.has(exposed))
-            exposed = `${this.name}__${t.name}`;
-          mcpRegistry.set(exposed, { client: this, realName: t.name, schema: t });
-        }
-        console.log(dim(`✓ MCP '${this.name}' connected (${tools.length} tools)`));
-      }).catch(e => {
-        console.log(yellow(`! MCP server '${this.name}' tool list failed: ${e.message}`));
-      });
-    }).catch(e => {
-      console.log(yellow(`! MCP server '${this.name}' initialize failed: ${e.message}`));
     });
   }
   _onData(chunk) {
@@ -590,47 +583,54 @@ class McpClient {
       this.buf = this.buf.slice(idx + 1);
       if (!line) continue;
       let msg; try { msg = JSON.parse(line); } catch { continue; }
-      if (msg.id !== undefined && this.pending.has(msg.id)) {
-        const { resolve, reject } = this.pending.get(msg.id);
-        this.pending.delete(msg.id);
-        msg.error ? reject(new Error(msg.error.message || "MCP error")) : resolve(msg.result);
-      }
+      this._dispatch(msg);
     }
+  }
+  _dispatch(msg) {
+    if (msg == null || msg.id === undefined || !this.pending.has(msg.id)) return;
+    const { resolve, reject } = this.pending.get(msg.id);
+    this.pending.delete(msg.id);
+    msg.error ? reject(new Error(msg.error.message || "MCP error")) : resolve(msg.result);
   }
   _send(msg) {
     if (this.transport === "stdio") {
       try { this.proc.stdin.write(JSON.stringify(msg) + "\n"); } catch {}
-    } else if (this.transport === "sse" || this.transport === "http") {
-      this._sendHttp(msg);
-    }
-  }
-  async _sendHttp(msg) {
-    if (!this.sseEndpoint) {
-      // Not yet connected
       return;
     }
-    try {
-      const res = await fetch(this.sseEndpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(msg),
-      });
-      const data = await res.json();
-      if (data.id !== undefined && this.pending.has(data.id)) {
-        const { resolve, reject } = this.pending.get(data.id);
-        this.pending.delete(data.id);
-        data.error ? reject(new Error(data.error.message || "MCP error")) : resolve(data.result);
+    this._sendHttp(msg).catch(e => {
+      if (msg.id !== undefined && this.pending.has(msg.id)) {
+        const { reject } = this.pending.get(msg.id);
+        this.pending.delete(msg.id);
+        reject(e);
       }
-    } catch (e) {
-      // Find pending request and reject
-      for (const [id, { reject }] of this.pending) {
-        if (id === msg.id) {
-          this.pending.delete(id);
-          reject(e);
-          break;
-        }
-      }
+    });
+  }
+  async _sendHttp(msg) {
+    if (!this.sseEndpoint) throw new Error("MCP HTTP endpoint not set");
+    const headers = {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+      ...(this.cfg.headers || {}),
+    };
+    if (this.httpSession) headers["mcp-session-id"] = this.httpSession;
+    const res = await fetch(this.sseEndpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(msg),
+    });
+    const sid = res.headers.get("mcp-session-id") || res.headers.get("Mcp-Session-Id");
+    if (sid) this.httpSession = sid;
+    if (msg.id === undefined) return; // notification
+    const ct = res.headers.get("content-type") || "";
+    let data;
+    if (ct.includes("text/event-stream")) data = parseSseJsonRpc(await res.text());
+    else {
+      const text = await res.text();
+      try { data = JSON.parse(text); }
+      catch { data = parseSseJsonRpc(text); }
     }
+    if (!data) throw new Error(`MCP HTTP ${res.status} empty body`);
+    this._dispatch(data);
   }
   request(method, params, timeoutMs = 30000) {
     const id = this.nextId++;
@@ -650,16 +650,11 @@ class McpClient {
       capabilities: {},
       clientInfo: { name: "ai-agent", version: VERSION },
     });
-    if (this.transport === "stdio") {
-      this._send({ jsonrpc: "2.0", method: "notifications/initialized" });
-    } else {
-      // For HTTP/SSE, send initialized notification too
-      this._send({ jsonrpc: "2.0", method: "notifications/initialized" });
-    }
+    this._send({ jsonrpc: "2.0", method: "notifications/initialized" });
   }
   async listTools() { this.tools = (await this.request("tools/list", {})).tools || []; return this.tools; }
   async callTool(name, args, timeoutMs) {
-    const res = await this.request("tools/call", { name, arguments: args }, timeoutMs);
+    const res = await this.request("tools/call", { name, arguments: args || {} }, timeoutMs || 120000);
     const parts = (res.content || []).map(c =>
       c.type === "text" ? c.text : `[${c.type}] ` + JSON.stringify(c));
     return [!res.isError, parts.join("\n") || "[no output]"];
@@ -667,7 +662,7 @@ class McpClient {
   stop() {
     if (this.transport === "stdio") {
       try { this.proc?.kill(); } catch {}
-    } else if (this.transport === "sse" || this.transport === "http") {
+    } else {
       try { this.sseSource?.close(); } catch {}
     }
   }
@@ -679,22 +674,17 @@ async function connectMcp() {
   for (const [sname, scfg] of Object.entries(servers)) {
     const client = new McpClient(sname, scfg);
     try {
-      client.start();
-      // For stdio transport, initialize and list tools synchronously
-      // For SSE/HTTP, initialization happens asynchronously in _onReady()
-      if (client.transport === "stdio") {
-        await client.initialize();
-        const tools = await client.listTools();
-        mcpClients.set(sname, client);
-        for (const t of tools) {
-          let exposed = t.name;
-          if (TOOLS.some(x => x.function.name === exposed) || mcpRegistry.has(exposed))
-            exposed = `${sname}__${t.name}`;
-          mcpRegistry.set(exposed, { client, realName: t.name, schema: t });
-        }
-        console.log(dim(`✓ MCP '${sname}' connected (${tools.length} tools)`));
+      await client.start();
+      await client.initialize();
+      const tools = await client.listTools();
+      mcpClients.set(sname, client);
+      for (const t of tools) {
+        let exposed = t.name;
+        if (TOOLS.some(x => x.function.name === exposed) || mcpRegistry.has(exposed))
+          exposed = `${sname}__${t.name}`;
+        mcpRegistry.set(exposed, { client, realName: t.name, schema: t });
       }
-      // For SSE/HTTP, the connection is handled asynchronously in _onReady()
+      console.log(dim(`✓ MCP '${sname}' connected (${tools.length} tools)`));
     } catch (e) {
       console.log(yellow(`! MCP server '${sname}' failed: ${e.message}`));
       client.stop();
@@ -703,16 +693,35 @@ async function connectMcp() {
 }
 async function ensureMcp() { if (!mcpReady) { mcpReady = true; await connectMcp(); } }
 
+function enrichMcpDesc(name, desc) {
+  const d = (desc || "").trim();
+  if (/full-web-search/i.test(name))
+    return "PRIMARY tool for live internet research. Search the web and extract page content. Use instead of curl/wget. " + d;
+  if (/get-web-search-summaries/i.test(name))
+    return "Quick live web search (titles + snippets only). Use this first for 'search the web' / current facts. Never use shell curl. " + d;
+  if (/get-single-web-page-content/i.test(name))
+    return "Fetch and extract main text from one URL. Use instead of curl. " + d;
+  if (/search|web/i.test(name) && !d) return "Live web search MCP tool. Use this instead of curl/wget.";
+  return d || "MCP tool";
+}
 function allTools() {
-  const list = [...TOOLS];
+  const mcp = [];
   for (const [exposed, { schema }] of mcpRegistry) {
-    list.push({ type: "function", function: {
+    mcp.push({ type: "function", function: {
       name: exposed,
-      description: schema.description || "",
+      description: enrichMcpDesc(exposed, schema.description),
       parameters: schema.inputSchema || { type: "object", properties: {} },
     }});
   }
-  return list;
+  // MCP first so the model sees search tools before shell
+  return [...mcp, ...TOOLS];
+}
+function mcpPromptBlurb() {
+  if (!mcpRegistry.size) return "";
+  const names = [...mcpRegistry.keys()];
+  return "\nWEB SEARCH MCP (required for any live internet / current-events / URL fetch): " +
+    names.join(", ") +
+    ". Do not use the shell tool with curl, wget, or similar. Call these tools by name as JSON function calls.";
 }
 
 // ------------------------------------------------------------------ config
@@ -741,6 +750,7 @@ const systemPrompt = (cfg, userPrompt = "") => {
     s = cfg.system || SYS_PROMPT;
   }
   s += `\nOperating system: ${osDescription()} · shell: ${SHELL_NAME}. Use ONLY commands valid for this OS and shell.`;
+  s += mcpPromptBlurb();
   s += commandHints();
   const blocked = cfg.blockedCommands || DEFAULT_BLOCKED;
   if (blocked.length) s += `\n- BLOCKED command patterns (never run these): ${blocked.join("  |  ")}`;
@@ -1559,7 +1569,7 @@ async function agentTurn(cfg, history, keys) {
   if (cfg.tools) await ensureMcp();
   let tools = cfg.tools ? allTools() : [];
   if (cfg.mode === "ask") tools = [];
-  else if (cfg.mode === "plan") tools = tools.filter(t => ["read_file", "shell"].includes(t.function.name));
+  else if (cfg.mode === "plan") tools = tools.filter(t => ["read_file", "shell"].includes(t.function.name) || mcpRegistry.has(t.function.name));
   const lastUserMsg = [...history].reverse().find(m => m.role === "user")?.content || "";
   if (history[0]?.role === "system") history[0].content = systemPrompt(cfg, lastUserMsg);
 
@@ -2336,6 +2346,7 @@ async function main() {
   }
 
   banner(cfg);
+  await ensureMcp();
   process.stdin.setRawMode(true);
   process.stdin.resume();
   process.stdout.write("\x1b[>1u\x1b[?2004h");
