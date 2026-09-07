@@ -177,6 +177,7 @@ commands
   /set max_tokens <n>     reply length cap        /set maxout <n>  tool output cap (chars)
   /set max_steps <n>      tool-step cap (0 = unlimited; default)
   /set intercept <on|off> approval gate before mutating tools run
+  /set tools <on|off>     enable/disable native function calling
   /set system <prompt>    replace system prompt
   /mode <ask|plan|code>   agent mode (ask=chat, plan=read-only plan, code=full auto)
   /redact <on|off>        toggle silent secret redaction (default: on)
@@ -209,7 +210,7 @@ usage: node ai-agent.mjs [options] ["one-shot prompt"]
   --context <n>       --maxout <n>        --max-tokens <n>
   --max-steps <n>     tool-step cap (0 = unlimited; default)
   --intercept         approval gate before mutating tools run
-  --system <prompt>   --no-tools          --save   --list   -h`;
+  --system <prompt>   --no-tools / --tools  --save   --list   -h`;
 
 // ------------------------------------------------------------------ ui/color
 const USE_COLOR = process.stdout.isTTY && !process.env.NO_COLOR;
@@ -2221,9 +2222,15 @@ async function handleCommand(line, cfg, history, keys) {
         else if (k === "maxout") cfg.maxout = parseInt(v, 10);
         else if (k === "max_tokens") cfg.maxTokens = v ? parseInt(v, 10) : 0;
         else if (k === "intercept") cfg.intercept = ["on","true","1"].includes(v);
+        else if (k === "tools") {
+          const t = (v || "").toLowerCase();
+          if (["on","true","1","enable","enabled"].includes(t)) cfg.tools = true;
+          else if (["off","false","0","disable","disabled"].includes(t)) cfg.tools = false;
+          else { console.log(dim("usage: /set tools <on|off>")); return true; }
+        }
         else if (k === "max_steps") cfg.maxSteps = v ? parseInt(v, 10) : 0;
         else if (k === "system" && v) { cfg.system = v; if (history.length) history[0].content = systemPrompt(cfg); }
-        else { console.log(dim("usage: /set url|model|key|draft_model|temperature|reasoning|mode|redact|dir|context|max_tokens|maxout|intercept|max_steps|system <value>")); return true; }
+        else { console.log(dim("usage: /set url|model|key|draft_model|temperature|reasoning|mode|redact|dir|context|max_tokens|maxout|intercept|tools|max_steps|system <value>")); return true; }
         saveCfg(cfg);
         console.log(dim(`✓ ${k} updated`));
       } catch (e) { console.log(red(String(e.message))); }
@@ -2275,6 +2282,7 @@ function parseArgs(argv) {
       case "--mode": a.mode = next(); break;
       case "--intercept": case "-i": a.intercept = true; break;
       case "--no-tools": a.noTools = true; break;
+      case "--tools": a.tools = true; break;
       case "--list": a.list = true; break;
       case "--save": a.save = true; break;
       case "-h": case "--help": a.help = true; break;
@@ -2304,6 +2312,7 @@ async function main() {
   if (args.maxout) cfg.maxout = args.maxout;
   if (args.maxTokens) cfg.maxTokens = args.maxTokens;
   if (args.noTools) cfg.tools = false;
+  if (args.tools) cfg.tools = true;
   if (args.intercept) cfg.intercept = true;
   if (args.maxSteps !== undefined) cfg.maxSteps = args.maxSteps;
   if (args.draftModel) cfg.draftModel = args.draftModel;
