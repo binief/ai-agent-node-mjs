@@ -240,6 +240,57 @@ test("the goal is shown to the user even when the model never opens a task list"
   }
 });
 
+test("auto-planning can be switched off, and then plans nothing", async () => {
+  const { root, home, dir } = scratch();
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "a.js"), "export const a = 1;\n");
+
+  const mock = await startMockLLM([
+    { toolCalls: [{ name: "read_file", arguments: { path: "a.js" } }] },
+    { content: "It exports a constant." },
+  ]);
+
+  try {
+    const { out } = await runAgent({
+      url: mock.url, home, dir, extraArgs: ["--no-autoplan"],
+      prompt: "Make the export clearer, step by step.",
+    });
+
+    // no derived goal shown, no plan block, no gate
+    assert.doesNotMatch(out, /goal:/i);
+    assert.doesNotMatch(out, /following up/);
+    assert.doesNotMatch(out, /GOAL:/);
+
+    // the tool is not even offered
+    const names = mock.requests[0].tools.map(t => t.function.name);
+    assert.ok(!names.includes("update_plan"), "update_plan withheld: " + names.join(", "));
+
+    // and the model is told explicitly not to plan
+    assert.match(mock.requests[0].messages[0].content, /auto-planning is OFF/);
+  } finally {
+    await mock.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("auto-planning is on by default and offers update_plan", async () => {
+  const { root, home, dir } = scratch();
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true });
+
+  const mock = await startMockLLM([{ content: "ok" }]);
+  try {
+    const { out } = await runAgent({ url: mock.url, home, dir, prompt: "Do a multi-step refactor." });
+    assert.match(out, /goal: Do a multi-step refactor\./);
+    assert.ok(mock.requests[0].tools.some(t => t.function.name === "update_plan"));
+    assert.doesNotMatch(mock.requests[0].messages[0].content, /auto-planning is OFF/);
+  } finally {
+    await mock.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a plain question needs no plan and no follow-up nudge", async () => {  const { root, home, dir } = scratch();
   fs.mkdirSync(home, { recursive: true });
   fs.mkdirSync(dir, { recursive: true });

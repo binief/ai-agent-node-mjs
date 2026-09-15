@@ -13,7 +13,9 @@
  *   - Round-trip minimisation: batched tool calls are enforced by prompt rules, read_file
  *     takes `paths[]` to grab several files in one call, and each request reports the
  *     round trips / tool calls it cost.
- *   - /plan shows the goal + checklist; /plan goal <text> overrides; /plan clear resets.
+ *   - /plan shows the goal + checklist; /plan goal <text> sets one yourself; /plan clear resets.
+ *   - /set autoplan <on|off> (default on) turns auto goal/task creation off entirely;
+ *     an explicit `/plan goal <text>` still opts back in for that goal.
  *
  * v2.10.0 — v2.9.0 + loop detection:
  *   - Detects when the model repeats the same text output or tool calls
@@ -219,6 +221,8 @@ function newPlan(goal = "") {
     armed: false,            // gate is armed once the model engages the plan or starts changing files
     touched: false,          // model called update_plan during this turn
     dirty: false,            // checklist changed outside update_plan — needs a reprint
+    explicit: false,         // user set this goal via /plan goal — survives autoplan=off
+    announced: false,        // goal already shown to the user for this plan
     sinceUpdate: { shell: 0 },
     created: Date.now(),
   };
@@ -243,12 +247,12 @@ function seedGoal(text) {
 }
 // Per user message: keep the counters fresh, decide whether the follow-up gate applies.
 function startPlanTurn(goal) {
-  const created = !PLAN;
   const p = ensurePlan(goal);
   p.rounds = 0; p.calls = 0; p.mutations = 0; p.nudges = 0;
   p.touched = false; p.armed = planTasks(p).length > 0;   // open work from earlier ⇒ stay on it
-  // A goal derived from the prompt must be visible even if the model never opens a task list.
-  p.fresh = created && !!p.goal;
+  // A goal must be visible even if the model never opens a task list. Announce once per
+  // plan, whether it was derived from the prompt just now or set earlier via /plan goal.
+  p.fresh = !p.announced && !!p.goal;
   return p;
 }
 
@@ -527,13 +531,15 @@ commands
   /set dir <path>         project folder ('-' to clear)      /cd <path>  same as /set dir
   /set context <n|auto>   context window; enables trimming ('auto' = detect from API)
   /set max_tokens <n>     reply length cap        /set maxout <n>  tool output cap (chars)
+  /set autoplan <on|off>  auto-derive goal + tasks from each prompt (default: on)
   /set max_steps <n>      tool-step cap (0 = unlimited; default)
   /set intercept <on|off> approval gate before mutating tools run
   /set tools <on|off>     enable/disable native function calling
   /set system <prompt>    replace system prompt
   /mode <ask|plan|code>   agent mode (ask=chat, plan=read-only plan, code=full auto)
   /plan                   show the current goal + task checklist
-  /plan goal <text>       override the goal   /plan clear  drop the current plan
+  /plan goal <text>       set a goal yourself (works even with autoplan off)
+  /plan clear             drop the current plan
   /redact <on|off>        toggle silent secret redaction (default: on)
   /compact                summarize & shrink history (use when context is getting full)
   /block <regex>  /unblock <regex>  /blocked     manage command blocklist
@@ -553,6 +559,7 @@ notes
   - tools: update_plan, shell, read_file, str_replace, write_file, remember, forget, + MCP tools
   - the agent sets a goal from your prompt, splits it into tasks, works them to done,
     and refuses to stop while tasks are still open (follow-up nudge, max ${MAX_PLAN_NUDGES}x)
+    turn it off with /set autoplan off
   - env vars: AI_URL / AI_MODEL / AI_KEY / AI_DIR
 `;
 
@@ -567,6 +574,8 @@ usage: node ai-agent.mjs [options] ["one-shot prompt"]
   --context <n>       --maxout <n>        --max-tokens <n>
   --max-steps <n>     tool-step cap (0 = unlimited; default)
   --intercept         approval gate before mutating tools run
+  --autoplan <on|off>  auto-derive goal + tasks from the prompt (default: on)
+  --no-autoplan       same as --autoplan off
   --system <prompt>   --no-tools / --tools  --save   --list   -h`;
 
 // ------------------------------------------------------------------ ui/color
@@ -1087,7 +1096,7 @@ function mcpPromptBlurb() {
 function loadCfg() {
   const cfg = { apiUrl: "", model: "", apiKey: "", context: 0, maxout: 10000,
                 maxTokens: 0, tools: true, system: "", timeout: 180, projectDir: "",
-                intercept: false, autoYes: false, maxSteps: 0,
+                intercept: false, autoYes: false, maxSteps: 0, autoPlan: true,
                 blockedCommands: DEFAULT_BLOCKED,
                 draftModel: "", temperature: null,
                 reasoning: "", redact: true, mode: "code" };
@@ -1109,7 +1118,11 @@ const systemPrompt = (cfg, userPrompt = "") => {
     s = cfg.system || SYS_PROMPT;
   }
   s += `\nOperating system: ${osDescription()} · shell: ${SHELL_NAME}. Use ONLY commands valid for this OS and shell.`;
-  if (cfg.mode !== "ask") s += planPromptBlock();
+  if (cfg.mode !== "ask") {
+    if (cfg.autoPlan === false && PLAN?.explicit !== true)
+      s += "\nPLANNING: auto-planning is OFF for this user. Do NOT call `update_plan` and do not write a task list — just do the work directly and reply concisely.";
+    s += planPromptBlock();
+  }
   s += mcpPromptBlurb();
   s += commandHints();
   const blocked = cfg.blockedCommands || DEFAULT_BLOCKED;
@@ -1974,15 +1987,23 @@ async function agentTurn(cfg, history, keys) {
   if (cfg.mode === "ask") tools = [];
   else if (cfg.mode === "plan") tools = tools.filter(t => ["read_file", "shell", "update_plan"].includes(t.function.name) || mcpRegistry.has(t.function.name));
   const lastUserMsg = [...history].reverse().find(m => m.role === "user")?.content || "";
-  // Derive the goal from the prompt itself; the model refines it via update_plan.
-  const plan = cfg.mode === "ask" ? null : startPlanTurn(seedGoal(lastUserMsg));
+  // Auto-planning: derive a goal from the prompt and let the model decompose it into tasks.
+  // Switched off with /set autoplan off — but an explicit `/plan goal <text>` still opts in,
+  // so turning auto off does not lock you out of planning when you want it.
+  const auto = cfg.autoPlan !== false;
+  const wantPlan = cfg.mode !== "ask" && (auto || PLAN?.explicit === true);
+  const plan = wantPlan ? startPlanTurn(auto ? seedGoal(lastUserMsg) : "") : null;
+  if (!wantPlan) tools = tools.filter(t => t.function.name !== "update_plan");
   const hasSystem = history[0]?.role === "system";
   // Rebuilt on EVERY model call, not once per turn: the plan block has to track the live
   // task state, otherwise the model sees the checklist it wrote at the start and stops
   // following its own progress.
   const refreshSystem = () => { if (hasSystem) history[0].content = systemPrompt(cfg, lastUserMsg); };
   refreshSystem();
-  if (plan?.fresh) { console.log(dim("⌾ goal: ") + dim(plan.goal)); plan.fresh = false; }
+  if (plan?.fresh) {
+    console.log(dim("⌾ goal: ") + dim(plan.goal));
+    plan.fresh = false; plan.announced = true;
+  }
 
   const limit = Number(cfg.maxSteps) || 0;
   let step = 0;
@@ -2486,12 +2507,19 @@ async function handleCommand(line, cfg, history, keys) {
       if (sub === "clear" || sub === "reset") { resetPlan(); console.log(dim("plan cleared")); break; }
       if (sub === "goal") {
         if (!v) { console.log(dim("usage: /plan goal <one-sentence outcome>")); break; }
-        ensurePlan().goal = clean(v, 400);
-        console.log(dim("goal set — the model will keep this goal on its next turn"));
+        const p = ensurePlan();
+        p.goal = clean(v, 400);
+        p.explicit = true;   // user chose this goal, so it survives autoplan=off
+        p.announced = false; // show it on the next turn
+        console.log(dim("goal set — the model will plan against it from the next turn"));
+        if (cfg.autoPlan === false) console.log(dim("  (auto-planning is off; this explicit goal re-enables it)"));
         break;
       }
       if (!PLAN || !PLAN.tasks.length) {
-        console.log(dim(PLAN?.goal ? "no tasks yet — goal: " + PLAN.goal : "no active plan (the agent sets one from your prompt)"));
+        if (PLAN?.goal) console.log(dim("no tasks yet — goal: " + PLAN.goal));
+        else if (cfg.autoPlan === false)
+          console.log(dim("no active plan — auto-planning is off (/set autoplan on, or /plan goal <text>)"));
+        else console.log(dim("no active plan (the agent sets one from your prompt)"));
         break;
       }
       console.log(renderPlan(PLAN, "  "));
@@ -2651,6 +2679,7 @@ async function handleCommand(line, cfg, history, keys) {
         `\n  dir      ${cfg.projectDir ? displayPath(cfg.projectDir) : "(process cwd: " + displayPath(process.cwd()) + ")"}` +
         `\n  context  ${cfg.context || "not set (no trimming)"}\n  maxout   ${cfg.maxout}` +
         `   max_tokens ${cfg.maxTokens || "default"}\n  intercept ${cfg.intercept ? "on" : "off"}` +
+        `\n  autoplan ${cfg.autoPlan === false ? "off (no auto goal/tasks)" : "on (goal + tasks from prompt)"}` +
         `\n  max_steps ${cfg.maxSteps || "unlimited"}\n  blocked  ${(cfg.blockedCommands || DEFAULT_BLOCKED).length} pattern(s)` +
         `\n  mcp      ${mcpClients.size} server(s)\n  tools    ${cfg.tools ? "on" : "off"}` +
         `\n  data     ${DATA_DIR}`);
@@ -2704,9 +2733,21 @@ async function handleCommand(line, cfg, history, keys) {
           else if (["off","false","0","disable","disabled"].includes(t)) cfg.tools = false;
           else { console.log(dim("usage: /set tools <on|off>")); return true; }
         }
+        else if (k === "autoplan" || k === "auto_plan" || k === "plan") {
+          const t = (v || "").toLowerCase();
+          if (["on","true","1","enable","enabled"].includes(t)) cfg.autoPlan = true;
+          else if (["off","false","0","disable","disabled"].includes(t)) {
+            cfg.autoPlan = false;
+            resetPlan();   // drop any auto-derived goal so the change takes effect immediately
+          }
+          else { console.log(dim("usage: /set autoplan <on|off>")); return true; }
+          console.log(dim(cfg.autoPlan
+            ? "  goals + tasks are derived from your prompt automatically"
+            : "  no auto goal/tasks; set one yourself with /plan goal <text>"));
+        }
         else if (k === "max_steps") cfg.maxSteps = v ? parseInt(v, 10) : 0;
         else if (k === "system" && v) { cfg.system = v; if (history.length) history[0].content = systemPrompt(cfg); }
-        else { console.log(dim("usage: /set url|model|key|draft_model|temperature|reasoning|mode|redact|dir|context|max_tokens|maxout|intercept|tools|max_steps|system <value>")); return true; }
+        else { console.log(dim("usage: /set url|model|key|draft_model|temperature|reasoning|mode|redact|dir|context|max_tokens|maxout|intercept|tools|autoplan|max_steps|system <value>")); return true; }
         saveCfg(cfg);
         console.log(dim(`✓ ${k} updated`));
       } catch (e) { console.log(red(String(e.message))); }
@@ -2757,6 +2798,8 @@ function parseArgs(argv) {
       case "--reasoning": a.reasoning = next(); break;
       case "--mode": a.mode = next(); break;
       case "--intercept": case "-i": a.intercept = true; break;
+      case "--autoplan": case "--auto-plan": a.autoPlan = next(); break;
+      case "--no-autoplan": case "--no-auto-plan": a.autoPlan = "off"; break;
       case "--no-tools": a.noTools = true; break;
       case "--tools": a.tools = true; break;
       case "--list": a.list = true; break;
@@ -2794,6 +2837,7 @@ async function main() {
   if (args.draftModel) cfg.draftModel = args.draftModel;
   if (typeof args.temperature === "number" && !isNaN(args.temperature)) cfg.temperature = args.temperature;
   if (args.reasoning) cfg.reasoning = args.reasoning;
+  if (args.autoPlan) cfg.autoPlan = ["on","true","1"].includes(String(args.autoPlan).toLowerCase());
   if (args.mode) cfg.mode = args.mode;
   if (args.save) saveCfg(cfg);
 
@@ -2851,7 +2895,9 @@ async function main() {
     if (t.startsWith("/")) { if (!(await handleCommand(t, cfg, history, keys))) break; continue; }
     // A closed-out plan belongs to the previous request — start the next one with a fresh goal.
     // An unfinished plan is kept: the user is following up, and the agent must still close it out.
-    if (PLAN && !planOpen()) resetPlan();
+    // An explicit goal with no tasks yet is also kept, so `/plan goal` survives until the turn
+    // that actually uses it instead of being discarded before the model ever sees it.
+    if (PLAN && !planOpen() && (PLAN.tasks.length || !PLAN.explicit)) resetPlan();
     const snap = history.length;
     history.push({ role: "user", content: t });
     try {
