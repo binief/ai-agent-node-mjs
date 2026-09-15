@@ -243,9 +243,12 @@ function seedGoal(text) {
 }
 // Per user message: keep the counters fresh, decide whether the follow-up gate applies.
 function startPlanTurn(goal) {
+  const created = !PLAN;
   const p = ensurePlan(goal);
   p.rounds = 0; p.calls = 0; p.mutations = 0; p.nudges = 0;
   p.touched = false; p.armed = planTasks(p).length > 0;   // open work from earlier ⇒ stay on it
+  // A goal derived from the prompt must be visible even if the model never opens a task list.
+  p.fresh = created && !!p.goal;
   return p;
 }
 
@@ -354,7 +357,8 @@ function applyPlanUpdate(a, cfg) {
 }
 
 function renderPlan(p = PLAN, prefix = "  ") {
-  if (!p || !p.tasks.length) return "";
+  if (!p) return "";
+  if (!p.tasks.length) return p.goal ? `${prefix}GOAL: ${p.goal}   [no tasks yet]` : "";
   const done = p.tasks.filter(t => t.status === "done").length;
   const lines = [`${prefix}GOAL: ${p.goal || "(unset)"}   [${done}/${p.tasks.length} done]`];
   for (const t of p.tasks) {
@@ -1978,6 +1982,7 @@ async function agentTurn(cfg, history, keys) {
   // following its own progress.
   const refreshSystem = () => { if (hasSystem) history[0].content = systemPrompt(cfg, lastUserMsg); };
   refreshSystem();
+  if (plan?.fresh) { console.log(dim("⌾ goal: ") + dim(plan.goal)); plan.fresh = false; }
 
   const limit = Number(cfg.maxSteps) || 0;
   let step = 0;

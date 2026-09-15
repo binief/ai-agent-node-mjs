@@ -216,6 +216,30 @@ test("the update_plan tool schema the agent advertises is well-formed", async ()
   }
 });
 
+test("the goal is shown to the user even when the model never opens a task list", async () => {
+  const { root, home, dir } = scratch();
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "a.js"), "export const a = 1;\n");
+
+  const mock = await startMockLLM([
+    // never calls update_plan — the goal still has to be visible
+    { toolCalls: [{ name: "read_file", arguments: { path: "a.js" } }] },
+    { content: "It exports a constant." },
+  ]);
+
+  try {
+    const { out } = await runAgent({ url: mock.url, home, dir, prompt: "Make the export clearer." });
+    assert.match(out, /goal: Make the export clearer\./);
+    // the derived goal is also carried into the system prompt for the model
+    assert.match(mock.requests.at(-1).messages[0].content, /YOUR CURRENT PLAN/);
+    assert.match(mock.requests.at(-1).messages[0].content, /no tasks yet/);
+  } finally {
+    await mock.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a plain question needs no plan and no follow-up nudge", async () => {  const { root, home, dir } = scratch();
   fs.mkdirSync(home, { recursive: true });
   fs.mkdirSync(dir, { recursive: true });
