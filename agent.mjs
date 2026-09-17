@@ -3,6 +3,15 @@
  * ai-agent.mjs — minimal, fully-working, self-learning terminal AI agent.
  * Node >= 18, ZERO dependencies (stdlib only).
  *
+ * v2.12.0 — v2.11.0 + configurable streaming:
+ *   - `/set stream <on|off>` (default on) — also `--stream on|off` / `--no-stream` and
+ *     env AI_STREAM. When off, the model endpoint is called with `"stream": false` and the
+ *     single JSON reply is parsed natively (content, reasoning, tool_calls, usage), so
+ *     OpenAI-compatible servers that don't do SSE (e.g. vLLM/LM Studio at localhost:8000)
+ *     work with a plain curl-style request.
+ *   - In stream mode nothing changes, and a server that replies with JSON anyway is still
+ *     handled by the existing fallback.
+ *
  * v2.11.0 — v2.10.0 + goal → tasks → follow-up loop:
  *   - `update_plan` tool: the agent turns the prompt into one explicit GOAL and 3-12
  *     verifiable TASKS, each with a `verify` check that proves it works.
@@ -57,7 +66,7 @@ import { exec, spawn } from "node:child_process";
 import process from "node:process";
 import { EventSource } from "eventsource";
 
-const VERSION = "2.11.0";
+const VERSION = "2.12.0";
 
 // ------------------------------------------------------------------ data folder
 const DATA_DIR = path.join(os.homedir(), ".aiterm");
@@ -535,6 +544,7 @@ commands
   /set max_steps <n>      tool-step cap (0 = unlimited; default)
   /set intercept <on|off> approval gate before mutating tools run
   /set tools <on|off>     enable/disable native function calling
+  /set stream <on|off>    streaming replies (on = SSE chunks; off = "stream": false, single JSON)
   /set system <prompt>    replace system prompt
   /mode <ask|plan|code>   agent mode (ask=chat, plan=read-only plan, code=full auto)
   /plan                   show the current goal + task checklist
@@ -574,6 +584,7 @@ usage: node ai-agent.mjs [options] ["one-shot prompt"]
   --context <n>       --maxout <n>        --max-tokens <n>
   --max-steps <n>     tool-step cap (0 = unlimited; default)
   --intercept         approval gate before mutating tools run
+  --stream <on|off>   streaming model replies (default on); --no-stream = single JSON reply
   --autoplan <on|off>  auto-derive goal + tasks from the prompt (default: on)
   --no-autoplan       same as --autoplan off
   --system <prompt>   --no-tools / --tools  --save   --list   -h`;
@@ -1099,7 +1110,7 @@ function loadCfg() {
                 intercept: false, autoYes: false, maxSteps: 0, autoPlan: true,
                 blockedCommands: DEFAULT_BLOCKED,
                 draftModel: "", temperature: null,
-                reasoning: "", redact: true, mode: "code" };
+                reasoning: "", redact: true, mode: "code", stream: true };
   try { Object.assign(cfg, JSON.parse(fs.readFileSync(CFG_PATH, "utf8"))); } catch {}
   return cfg;
 }
@@ -1404,11 +1415,14 @@ function repairToolCalls(slots) {
 }
 
 // ------------------------------------------------------------------ streaming
+// cfg.stream === false → single JSON reply ("stream": false), otherwise SSE chunks.
+// Both modes yield the same events: {type:"thinking"} / {type:"delta"} / {type:"end", result}.
 async function* streamChat(cfg, messages, tools, signal) {
-  const payload = { model: cfg.model, messages, stream: true };
+  const nonStream = cfg.stream === false;
+  const payload = { model: cfg.model, messages, stream: !nonStream };
   if (tools?.length) payload.tools = tools;
   if (cfg.maxTokens) payload.max_tokens = cfg.maxTokens;
-  if (!cfg._noStreamOpts) payload.stream_options = { include_usage: true };
+  if (!nonStream && !cfg._noStreamOpts) payload.stream_options = { include_usage: true };
   if (cfg.draftModel) payload.draft_model = cfg.draftModel;
   if (typeof cfg.temperature === "number" && !isNaN(cfg.temperature)) payload.temperature = cfg.temperature;
   if (cfg.reasoning) payload.reasoning_effort = cfg.reasoning;
@@ -1419,7 +1433,7 @@ async function* streamChat(cfg, messages, tools, signal) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Accept: "text/event-stream",
+        Accept: nonStream ? "application/json" : "text/event-stream",
         ...(cfg.apiKey ? { Authorization: "Bearer " + cfg.apiKey } : {}),
       },
       body: JSON.stringify(payload),
@@ -1432,6 +1446,14 @@ async function* streamChat(cfg, messages, tools, signal) {
   if (!res.ok) throw new ApiError(`HTTP ${res.status} ${await errText(res)}`);
   if (!res.body) throw new ApiError("empty response body");
 
+  // Misbehaving server: asked for JSON but got SSE anyway — fall back to the SSE parser.
+  const ct = (res.headers.get("content-type") || "").toLowerCase();
+  if (nonStream && ct.includes("text/event-stream")) { yield* sseChatEvents(res); return; }
+  if (nonStream) { yield* jsonChatEvents(res); return; }
+  yield* sseChatEvents(res);
+}
+
+async function* sseChatEvents(res) {
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = "", content = "", thinking = "", finish = null, done = false, usage = null;
@@ -1482,6 +1504,35 @@ async function* streamChat(cfg, messages, tools, signal) {
 
   yield { type: "end", result: {
     content, thinking, finish, usage,
+    toolCalls: repairToolCalls(tcs),
+  } };
+}
+
+// Non-streaming mode ("stream": false): one JSON body with the complete message.
+async function* jsonChatEvents(res) {
+  let j;
+  try {
+    j = JSON.parse(await res.text());
+  } catch (e) {
+    throw new ApiError("invalid JSON response body (non-stream mode)");
+  }
+  if (j.error) throw new ApiError(typeof j.error === "string" ? j.error : (j.error.message || JSON.stringify(j.error)));
+  const ch = j.choices?.[0] || {};
+  const m = ch.message || ch.delta || {};
+  const think = m.reasoning_content || m.reasoning || m.thinking || "";
+  if (think) yield { type: "thinking", text: think };
+  if (m.content) yield { type: "delta", text: m.content };
+  const tcs = [];
+  for (const tc of m.tool_calls || []) {
+    const a = tc.function?.arguments;
+    tcs.push({
+      id: tc.id || "", index: tc.index ?? null, name: tc.function?.name || "",
+      arguments: typeof a === "object" ? JSON.stringify(a) : (a || ""),
+    });
+  }
+  yield { type: "end", result: {
+    content: m.content || "", thinking: think,
+    finish: ch.finish_reason || null, usage: j.usage || null,
     toolCalls: repairToolCalls(tcs),
   } };
 }
@@ -2681,6 +2732,7 @@ async function handleCommand(line, cfg, history, keys) {
         `   max_tokens ${cfg.maxTokens || "default"}\n  intercept ${cfg.intercept ? "on" : "off"}` +
         `\n  autoplan ${cfg.autoPlan === false ? "off (no auto goal/tasks)" : "on (goal + tasks from prompt)"}` +
         `\n  max_steps ${cfg.maxSteps || "unlimited"}\n  blocked  ${(cfg.blockedCommands || DEFAULT_BLOCKED).length} pattern(s)` +
+        `\n  stream   ${cfg.stream === false ? 'off ("stream": false, single JSON reply)' : "on (SSE chunks)"}` +
         `\n  mcp      ${mcpClients.size} server(s)\n  tools    ${cfg.tools ? "on" : "off"}` +
         `\n  data     ${DATA_DIR}`);
       break;
@@ -2733,6 +2785,15 @@ async function handleCommand(line, cfg, history, keys) {
           else if (["off","false","0","disable","disabled"].includes(t)) cfg.tools = false;
           else { console.log(dim("usage: /set tools <on|off>")); return true; }
         }
+        else if (k === "stream") {
+          const t = (v || "").toLowerCase();
+          if (["on","true","1","enable","enabled"].includes(t)) cfg.stream = true;
+          else if (["off","false","0","disable","disabled"].includes(t)) cfg.stream = false;
+          else { console.log(dim("usage: /set stream <on|off>")); return true; }
+          console.log(dim(cfg.stream
+            ? "  requests use stream:true — SSE chunks as they arrive"
+            : "  requests use stream:false — one JSON reply per model call"));
+        }
         else if (k === "autoplan" || k === "auto_plan" || k === "plan") {
           const t = (v || "").toLowerCase();
           if (["on","true","1","enable","enabled"].includes(t)) cfg.autoPlan = true;
@@ -2747,7 +2808,7 @@ async function handleCommand(line, cfg, history, keys) {
         }
         else if (k === "max_steps") cfg.maxSteps = v ? parseInt(v, 10) : 0;
         else if (k === "system" && v) { cfg.system = v; if (history.length) history[0].content = systemPrompt(cfg); }
-        else { console.log(dim("usage: /set url|model|key|draft_model|temperature|reasoning|mode|redact|dir|context|max_tokens|maxout|intercept|tools|autoplan|max_steps|system <value>")); return true; }
+        else { console.log(dim("usage: /set url|model|key|draft_model|temperature|reasoning|mode|redact|dir|context|max_tokens|maxout|intercept|tools|stream|autoplan|max_steps|system <value>")); return true; }
         saveCfg(cfg);
         console.log(dim(`✓ ${k} updated`));
       } catch (e) { console.log(red(String(e.message))); }
@@ -2773,7 +2834,7 @@ async function handleCommand(line, cfg, history, keys) {
 function banner(cfg) {
   const dir = cfg.projectDir ? displayPath(cfg.projectDir) : displayPath(process.cwd());
   const modeStr = cfg.mode && cfg.mode !== "code" ? "  ·  mode " + cfg.mode : "";
-  console.log(bold("◆ ai-agent") + dim(`  ${cfg.model} @ ${cfg.apiUrl}  ·  ${osDescription()}  ·  ctx ${cfg.context ? fmtK(cfg.context) : "unknown"}  ·  key ${cfg.apiKey ? "✓" : "—"}` + (cfg.draftModel ? `  ·  draft ${cfg.draftModel}` : "") + (cfg.temperature != null ? `  ·  temp ${cfg.temperature}` : "") + (cfg.reasoning ? `  ·  reasoning ${cfg.reasoning}` : "") + (cfg.intercept ? "  ·  🔒 intercept" : "") + modeStr));
+  console.log(bold("◆ ai-agent") + dim(`  ${cfg.model} @ ${cfg.apiUrl}  ·  ${osDescription()}  ·  ctx ${cfg.context ? fmtK(cfg.context) : "unknown"}  ·  key ${cfg.apiKey ? "✓" : "—"}` + (cfg.draftModel ? `  ·  draft ${cfg.draftModel}` : "") + (cfg.temperature != null ? `  ·  temp ${cfg.temperature}` : "") + (cfg.reasoning ? `  ·  reasoning ${cfg.reasoning}` : "") + (cfg.intercept ? "  ·  🔒 intercept" : "") + (cfg.stream === false ? "  ·  stream off" : "") + modeStr));
   console.log(dim(`  📁 ${dir}   ·   data: ${DATA_DIR}`));
   console.log(dim("  enter send · shift+enter newline (or \\+enter) · @file+Tab complete · ^C cancel · ^D exit · /help"));
 }
@@ -2802,6 +2863,8 @@ function parseArgs(argv) {
       case "--no-autoplan": case "--no-auto-plan": a.autoPlan = "off"; break;
       case "--no-tools": a.noTools = true; break;
       case "--tools": a.tools = true; break;
+      case "--stream": a.stream = next(); break;
+      case "--no-stream": a.noStream = true; break;
       case "--list": a.list = true; break;
       case "--save": a.save = true; break;
       case "-h": case "--help": a.help = true; break;
@@ -2822,6 +2885,7 @@ async function main() {
   cfg.apiKey = process.env.AI_KEY || process.env.OPENAI_API_KEY || cfg.apiKey;
   cfg.model = process.env.AI_MODEL || cfg.model;
   cfg.projectDir = process.env.AI_DIR || cfg.projectDir;
+  if (process.env.AI_STREAM) cfg.stream = ["on","true","1"].includes(process.env.AI_STREAM.toLowerCase());
   if (args.url) cfg.apiUrl = args.url;
   if (args.model) cfg.model = args.model;
   if (args.key) cfg.apiKey = args.key;
@@ -2832,6 +2896,8 @@ async function main() {
   if (args.maxTokens) cfg.maxTokens = args.maxTokens;
   if (args.noTools) cfg.tools = false;
   if (args.tools) cfg.tools = true;
+  if (args.stream !== undefined) cfg.stream = ["on","true","1"].includes(String(args.stream).toLowerCase());
+  if (args.noStream) cfg.stream = false;
   if (args.intercept) cfg.intercept = true;
   if (args.maxSteps !== undefined) cfg.maxSteps = args.maxSteps;
   if (args.draftModel) cfg.draftModel = args.draftModel;
