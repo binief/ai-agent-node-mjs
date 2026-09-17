@@ -34,6 +34,31 @@ export async function startMockLLM(turns) {
       const turn = turns[Math.min(served, turns.length - 1)] || {};
       served++;
 
+      // Non-streaming mode: the agent asked for "stream": false — one JSON body.
+      if (payload.stream === false) {
+        const message = {};
+        if (turn.content) message.content = turn.content;
+        if (turn.reasoning) message.reasoning_content = turn.reasoning;
+        if (turn.toolCalls?.length) {
+          message.tool_calls = turn.toolCalls.map((tc, i) => ({
+            id: `call_${served}_${i}`,
+            type: "function",
+            function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
+          }));
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          id: "chatcmpl-mock-" + served,
+          choices: [{
+            index: 0,
+            message,
+            finish_reason: turn.toolCalls?.length ? "tool_calls" : "stop",
+          }],
+          usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
+        }));
+        return;
+      }
+
       res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
       if (turn.content) {
         // stream the text in two pieces, like a real server
