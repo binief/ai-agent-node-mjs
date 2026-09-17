@@ -3,6 +3,20 @@
  * ai-agent.mjs — minimal, fully-working, self-learning terminal AI agent.
  * Node >= 18, ZERO dependencies (stdlib only).
  *
+ * v2.11.0 — v2.10.0 + goal → tasks → follow-up loop:
+ *   - `update_plan` tool: the agent turns the prompt into one explicit GOAL and 3-12
+ *     verifiable TASKS, each with a `verify` check that proves it works.
+ *   - The plan is re-rendered into the system prompt on every model call, so the model
+ *     always sees its own progress, and a live checklist is printed in the terminal.
+ *   - Completion gate: the agent cannot end a turn while tasks are pending or while
+ *     "done" tasks were never verified — it gets pushed back (max 2x) to finish the work.
+ *   - Round-trip minimisation: batched tool calls are enforced by prompt rules, read_file
+ *     takes `paths[]` to grab several files in one call, and each request reports the
+ *     round trips / tool calls it cost.
+ *   - /plan shows the goal + checklist; /plan goal <text> sets one yourself; /plan clear resets.
+ *   - /set autoplan <on|off> (default on) turns auto goal/task creation off entirely;
+ *     an explicit `/plan goal <text>` still opts back in for that goal.
+ *
  * v2.10.0 — v2.9.0 + loop detection:
  *   - Detects when the model repeats the same text output or tool calls
  *   - Catches exact repeats, cycling patterns (A-B-A-B), and dominated sequences
@@ -43,7 +57,7 @@ import { exec, spawn } from "node:child_process";
 import process from "node:process";
 import { EventSource } from "eventsource";
 
-const VERSION = "2.10.0";
+const VERSION = "2.11.0";
 
 // ------------------------------------------------------------------ data folder
 const DATA_DIR = path.join(os.homedir(), ".aiterm");
@@ -100,24 +114,29 @@ const ALIASES = {
 const SYS_PROMPT =
   "You are an expert autonomous software-engineering agent with deep knowledge across programming languages and frameworks, operating in the user's project via a terminal.\n" +
   "The user gives you a task; work autonomously, using tools repeatedly until it is fully complete. Do not give up unless you are certain it cannot be done with the available tools.\n" +
+  "Do not stop to ask permission or ask clarifying questions mid-task: pick the most reasonable interpretation, state the assumption in one line, and keep going.\n" +
   "\n" +
-  "WORK METHOD:\n" +
-  "1. UNDERSTAND FIRST: infer the project type (language, framework, libraries) from the task and files. Explore before changing. Never assume — gather context, then act.\n" +
-  "2. DECOMPOSE: break complex tasks into small concepts; identify which files each one needs.\n" +
-  "3. GATHER CONTEXT EFFICIENTLY: prefer reading large meaningful chunks over many small reads. Use `shell` (grep/find/rg/dir) to locate code instead of guessing. Batch independent tool calls into one response.\n" +
-  "4. EDIT CORRECTLY: use `str_replace` for targeted edits (exact match); use `write_file` only for new files or full rewrites (full content, never placeholders). Follow existing conventions — indentation, style, naming, framework versions.\n" +
-  "5. USE ESTABLISHED LIBRARIES: if a well-known package solves a problem, install it properly (npm/pip/etc.) rather than reimplementing it.\n" +
-  "6. OMITTED CONTENT: if context shows an omission marker (e.g. '...lines omitted...'), read the real content before editing; never pass the marker into an edit.\n" +
-  "7. VALIDATE: after changes, run build/tests/linters via `shell` to confirm. Verify errors are actually fixed.\n" +
-  "8. ERROR LIMIT: if the same fix fails repeatedly, STOP and explain the blocker + options to the user instead of looping.\n" +
-  "9. ITERATE WITHOUT REPEATING: after each tool call, continue from where you left off. NEVER repeat the same tool call with the same arguments. NEVER output the same text twice in a row. If you notice you're going in circles, STOP and explain what's happening.\n" +
+  "WORK METHOD — goal, then tasks, then execution, then proof:\n" +
+  "1. SET THE GOAL: restate the user's prompt as one sentence describing the OUTCOME they want (not the steps). That sentence goes into `update_plan`.\n" +
+  "2. PLAN AS TASKS: for any request needing >1 step or any file change, call `update_plan` FIRST with the goal and 3-12 concrete, individually verifiable tasks. Give each task a `verify` — the command or check that proves it works. Skip the plan only for a pure question or a single trivial edit.\n" +
+  "3. UNDERSTAND FIRST: infer the project type (language, framework, libraries) from the task and files. Explore before changing. Never assume — gather context, then act.\n" +
+  "4. WORK ONE TASK AT A TIME: mark it in_progress, do it, verify it, mark it done, then move to the next. Update the plan as you go so the list always matches reality.\n" +
+  "5. MINIMISE ROUND TRIPS: issue every independent tool call in ONE response — read all the files you need together (or pass `paths` to read_file), run exploration commands chained with && , and never make a call whose result you could have obtained in the same batch. Do not re-read a file you just wrote, and do not re-run a command that already succeeded.\n" +
+  "6. GATHER CONTEXT EFFICIENTLY: prefer reading large meaningful chunks over many small reads. Use `shell` (grep/find/rg/dir) to locate code instead of guessing.\n" +
+  "7. EDIT CORRECTLY: use `str_replace` for targeted edits (exact match); use `write_file` only for new files or full rewrites (full content, never placeholders). Follow existing conventions — indentation, style, naming, framework versions.\n" +
+  "8. USE ESTABLISHED LIBRARIES: if a well-known package solves a problem, install it properly (npm/pip/etc.) rather than reimplementing it.\n" +
+  "9. OMITTED CONTENT: if context shows an omission marker (e.g. '...lines omitted...'), read the real content before editing; never pass the marker into an edit.\n" +
+  "10. VERIFY AND FOLLOW UP: run the build/tests/linters named in your tasks' `verify` fields and confirm they actually pass. A task is done only when its check passed — never mark done on intent. If a check fails, fix it in the same turn.\n" +
+  "11. CLOSE OUT: do not end while tasks are pending. Every task ends as done, blocked (with a reason) or skipped (with a reason).\n" +
+  "12. ERROR LIMIT: if the same fix fails repeatedly, mark that task blocked with the reason, finish everything else, then explain the blocker + options to the user instead of looping.\n" +
+  "13. ITERATE WITHOUT REPEATING: after each tool call, continue from where you left off. NEVER repeat the same tool call with the same arguments. NEVER output the same text twice in a row. If you notice you're going in circles, STOP and explain what's happening.\n" +
   "\n" +
   "SHELLS: use cmd-style commands; PowerShell is blocked. Use background=true for dev servers/watchers.\n" +
   "NO COMMENTS: never add filler/explanatory comments to code unless asked.\n" +
   "MEMORY: use `remember` to persist lessons/preferences/workarounds; check recalled memories for past solutions to similar problems.\n" +
   "SAFETY: avoid destructive commands unless clearly required; never hardcode secrets; refuse harmful/illegal requests briefly.\n" +
   "TERSE: no preamble, no restating, no apologies.\n" +
-  "FINISH: when done, reply with a 1-3 line summary of what changed and how it was validated.\n"+
+  "FINISH: when the plan is closed out, reply with a 1-3 line summary of what changed and how it was validated.\n"+
   "TOOLS: tool calls should be in json format not xml.";
 
 const MAX_FAIL_STREAK = 3;
@@ -177,10 +196,282 @@ function detectLoop(recentSigs) {
   return null;
 }
 
+// ------------------------------------------------------------------ goal & task tracking
+// The agent turns the user's prompt into an explicit GOAL, decomposes it into TASKS, executes
+// them (batching tool calls so the request costs as few round trips as possible), and is held
+// to the list until every task is done/blocked/skipped. The list is re-rendered into the system
+// prompt on every model call, so the model always sees its own progress and what is outstanding,
+// and `planGate` refuses to end the turn while work is still open.
+const TASK_STATUS = ["pending", "in_progress", "done", "blocked", "skipped"];
+const ACTIVE_STATUS = new Set(["pending", "in_progress"]);
+const PLAN_ICON = { pending: "☐", in_progress: "◐", done: "✓", blocked: "✗", skipped: "‒" };
+const MAX_PLAN_NUDGES = 2;   // how many times the completion gate pushes back per turn
+const MAX_PLAN_TASKS = 24;
+
+let PLAN = null;             // session-scoped: { goal, tasks[], rounds, calls, nudges, armed, … }
+
+function newPlan(goal = "") {
+  return {
+    goal: String(goal || "").replace(/\s+/g, " ").trim().slice(0, 400),
+    tasks: [],
+    rounds: 0,               // model round trips for the current user message
+    calls: 0,                // tool calls executed for the current user message
+    mutations: 0,            // mutating tool calls for the current user message
+    nudges: 0,               // completion-gate pushbacks used this turn
+    armed: false,            // gate is armed once the model engages the plan or starts changing files
+    touched: false,          // model called update_plan during this turn
+    dirty: false,            // checklist changed outside update_plan — needs a reprint
+    explicit: false,         // user set this goal via /plan goal — survives autoplan=off
+    announced: false,        // goal already shown to the user for this plan
+    sinceUpdate: { shell: 0 },
+    created: Date.now(),
+  };
+}
+function ensurePlan(goal = "") {
+  if (!PLAN) PLAN = newPlan(goal);
+  else if (goal && !PLAN.goal) PLAN.goal = String(goal).replace(/\s+/g, " ").trim().slice(0, 400);
+  return PLAN;
+}
+function resetPlan() { PLAN = null; }
+function planTasks(p = PLAN) { return p ? p.tasks : []; }
+function activeTasks(p = PLAN) { return planTasks(p).filter(t => ACTIVE_STATUS.has(t.status)); }
+function planOpen(p = PLAN) { return activeTasks(p).length; }
+// First-cut goal taken straight from the user's prompt, so the tracker always has one even if
+// the model never calls update_plan. The model refines it on its first update_plan call.
+function seedGoal(text) {
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+  if (t.length <= 160) return t;
+  const cut = t.slice(0, 160).search(/[.!?](\s|$)/);
+  return (cut > 40 ? t.slice(0, cut + 1) : t.slice(0, 160)).trim();
+}
+// Per user message: keep the counters fresh, decide whether the follow-up gate applies.
+function startPlanTurn(goal) {
+  const p = ensurePlan(goal);
+  p.rounds = 0; p.calls = 0; p.mutations = 0; p.nudges = 0;
+  p.touched = false; p.armed = planTasks(p).length > 0;   // open work from earlier ⇒ stay on it
+  // A goal must be visible even if the model never opens a task list. Announce once per
+  // plan, whether it was derived from the prompt just now or set earlier via /plan goal.
+  p.fresh = !p.announced && !!p.goal;
+  return p;
+}
+
+const clean = (s, n) => String(s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+function normalizeStatus(s) {
+  const v = String(s ?? "pending").toLowerCase().replace(/[\s-]/g, "_");
+  if (v === "doing" || v === "active" || v === "working" || v === "started") return "in_progress";
+  if (v === "complete" || v === "completed" || v === "finished") return "done";
+  if (v === "todo" || v === "open" || v === "queued") return "pending";
+  return TASK_STATUS.includes(v) ? v : "pending";
+}
+function normalizeTask(raw, i, prev) {
+  const o = raw && typeof raw === "object" ? raw : { content: String(raw ?? "") };
+  const id = clean(o.id ?? o.task_id ?? prev?.id ?? `t${i + 1}`, 24);
+  return {
+    id,
+    content: clean(o.content ?? o.task ?? o.title ?? o.description ?? prev?.content ?? "", 200),
+    status: normalizeStatus(o.status ?? o.state ?? prev?.status),
+    verify: clean(o.verify ?? o.check ?? o.verification ?? prev?.verify ?? "", 160),
+    note: clean(o.note ?? o.notes ?? o.reason ?? o.blocker ?? prev?.note ?? "", 200),
+    unverified: false,
+  };
+}
+
+// Heuristic: did `cmd` actually perform the check described by `verify`?
+// Loose on purpose — a false negative only costs one extra nudge, a false positive hides unverified work.
+function verifySeen(cmd, verify) {
+  const hay = String(cmd || "").toLowerCase();
+  const toks = String(verify || "").toLowerCase().match(/[a-z0-9_.@/\\-]{4,}/g) || [];
+  if (!toks.length) return false;
+  const need = Math.max(1, Math.ceil(toks.length * 0.5));
+  return toks.filter(t => hay.includes(t)).length >= need;
+}
+// Called after every shell run so "marked done but never verified" tasks can be cleared.
+function noteShellRan(cmd, ok) {
+  if (!PLAN || !ok) return;
+  PLAN.sinceUpdate.shell++;
+  for (const t of PLAN.tasks) {
+    if (t.unverified && verifySeen(cmd, t.verify)) {
+      t.unverified = false;
+      PLAN.dirty = true;   // checklist changed — reprint it for the user
+    }
+  }
+}
+
+function applyPlanUpdate(a, cfg) {
+  const p = ensurePlan(a?.goal);
+  const warnings = [];
+  const prevById = new Map(p.tasks.map(t => [t.id, t]));
+  const prevByPos = new Map(p.tasks.map((t, i) => [String(i + 1), t]));
+  // Shell runs executed since the LAST plan update prove the work — capture before resetting.
+  const ranSinceLast = p.sinceUpdate.shell;
+  p.touched = true;
+  p.armed = true;
+  p.nudges = 0;
+  p.sinceUpdate.shell = 0;
+
+  if (Array.isArray(a?.tasks) && a.tasks.length) {
+    const next = [];
+    const seen = new Set();
+    for (let i = 0; i < a.tasks.length && next.length < MAX_PLAN_TASKS; i++) {
+      const raw = a.tasks[i];
+      const hint = raw && typeof raw === "object" ? clean(raw.id ?? raw.task_id, 24) : "";
+      const prev = (hint && prevById.get(hint)) || prevByPos.get(String(i + 1)) || null;
+      const t = normalizeTask(raw, i, prev);
+      if (!t.content) { warnings.push(`task ${i + 1} had no content and was dropped`); continue; }
+      if (seen.has(t.id)) t.id = `${t.id}-${i + 1}`;
+      seen.add(t.id);
+      // A freshly-completed task counts as verified only if a check actually ran since the last update.
+      const wasDone = prev?.status === "done" && prev?.content === t.content;
+      if (t.status === "done" && t.verify && !wasDone && ranSinceLast === 0) t.unverified = true;
+      next.push(t);
+    }
+    if (a.tasks.length > MAX_PLAN_TASKS) warnings.push(`plan capped at ${MAX_PLAN_TASKS} tasks`);
+    p.tasks = next;
+  }
+
+  const patches = [];
+  if (Array.isArray(a?.updates)) patches.push(...a.updates);
+  else if (a && (a.id || a.task_id) && (a.status || a.state)) patches.push(a);
+  for (const u of patches) {
+    const id = clean(u?.id ?? u?.task_id, 24);
+    const t = p.tasks.find(x => x.id === id) || p.tasks[Number(id.replace(/\D/g, "")) - 1];
+    if (!t) { warnings.push(`unknown task id '${id || "?"}'`); continue; }
+    const status = normalizeStatus(u.status ?? u.state);
+    const note = clean(u.note ?? u.notes ?? u.reason ?? t.note, 200);
+    if ((status === "blocked" || status === "skipped") && !note)
+      warnings.push(`task ${t.id} ${status} without a reason — add a note`);
+    if (status === "done" && t.verify && ranSinceLast === 0) t.unverified = true;
+    if (status !== "done") t.unverified = false;
+    t.status = status; t.note = note;
+    if (u.verify) t.verify = clean(u.verify, 160);
+  }
+
+  if (String(a?.goal || "").trim()) p.goal = clean(a.goal, 400);
+  const done = p.tasks.filter(t => t.status === "done").length;
+  const open = activeTasks(p).length;
+  const head = p.tasks.length
+    ? `plan updated — ${done}/${p.tasks.length} done, ${open} still open`
+    : "plan updated (no tasks yet — add them)";
+  let msg = p.goal ? `${head}\nGOAL: ${p.goal}\n` : `${head}\n`;
+  msg += renderPlan(p, "  ") || "  (empty)";
+  if (warnings.length) msg += "\nnotes: " + warnings.join("; ");
+  msg += "\nNext: work the first open task, batching independent tool calls into one response.";
+  return [true, msg];
+}
+
+function renderPlan(p = PLAN, prefix = "  ") {
+  if (!p) return "";
+  if (!p.tasks.length) return p.goal ? `${prefix}GOAL: ${p.goal}   [no tasks yet]` : "";
+  const done = p.tasks.filter(t => t.status === "done").length;
+  const lines = [`${prefix}GOAL: ${p.goal || "(unset)"}   [${done}/${p.tasks.length} done]`];
+  for (const t of p.tasks) {
+    let l = `${prefix} ${PLAN_ICON[t.status] || "?"} [${t.id}] ${t.content}`;
+    if (t.status === "done" && t.verify) l += t.unverified ? `  (verify PENDING: ${t.verify})` : `  (verified: ${t.verify})`;
+    else if (t.verify) l += `  (verify: ${t.verify})`;
+    if (t.note && (t.status === "blocked" || t.status === "skipped")) l += `  — ${t.note}`;
+    lines.push(l);
+  }
+  return lines.join("\n");
+}
+function printPlan(p = PLAN) {
+  const r = renderPlan(p, "    ");
+  if (r) console.log(dim(r));
+}
+// Round-trip accounting: the whole point of the plan is to land the request in as few
+// model round trips as possible, so report what it actually cost.
+function printPlanSummary(p = PLAN) {
+  if (!p || (!p.rounds && !p.calls && !p.tasks.length)) return;
+  const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+  const bits = [plural(p.rounds, "round trip"), plural(p.calls, "tool call")];
+  if (p.tasks.length) {
+    const done = p.tasks.filter(t => t.status === "done").length;
+    const open = activeTasks(p).length;
+    const stalled = p.tasks.filter(t => t.status === "blocked" || t.status === "skipped").length;
+    bits.push(`plan ${done}/${p.tasks.length} done` + (open ? ` · ${open} open` : ""));
+    if (stalled) bits.push(`${stalled} blocked/skipped`);
+  }
+  if (p.nudges) bits.push(`${p.nudges} follow-up${p.nudges === 1 ? "" : "s"} needed`);
+  console.log(dim("  " + bits.join(" · ")));
+}
+
+// Re-rendered into the system prompt on every model call — this is how the model "follows up"
+// on its own implementation instead of drifting or stopping early.
+function planPromptBlock() {
+  if (!PLAN || (!PLAN.tasks.length && !PLAN.goal)) return "";
+  let s = "\n\nYOUR CURRENT PLAN (you own this list — keep it truthful):";
+  s += "\n" + (renderPlan(PLAN) || "  (no tasks yet)");
+  const open = activeTasks();
+  if (open.length) {
+    s += `\n${open.length} task(s) are NOT finished. Keep going on [${open[0].id}] without asking the user anything.`;
+    s += "\nFlip a task to done ONLY after it is implemented AND its `verify` check actually passed.";
+    s += "\nIf a task is genuinely impossible, mark it blocked with a note and move on — do not silently drop it.";
+  } else if (PLAN.tasks.length) {
+    s += "\nAll tasks are resolved. Reply with the final summary — do not re-open work.";
+  }
+  const unverified = PLAN.tasks.filter(t => t.status === "done" && t.verify && t.unverified);
+  if (unverified.length)
+    s += `\nUNVERIFIED (claimed done, no check run): ${unverified.map(t => `[${t.id}] run ${t.verify}`).join("; ")}`;
+  s += `\nRound trips used on this request: ${PLAN.rounds}. Batch every independent tool call into one response.`;
+  return s;
+}
+
+// Completion gate: returns a follow-up instruction when the model tried to stop with work open,
+// or null when it is allowed to end the turn.
+function planGate() {
+  const p = PLAN;
+  if (!p || !p.armed || !p.tasks.length) return null;
+  if (p.nudges >= MAX_PLAN_NUDGES) return null;
+  const open = activeTasks(p);
+  const unverified = p.tasks.filter(t => t.status === "done" && t.verify && t.unverified);
+  if (!open.length && !unverified.length) return null;
+  const parts = [];
+  if (open.length) {
+    parts.push(`${open.length} task(s) still open: ` + open.map(t => `[${t.id}] ${t.content}`).join(" | "));
+  }
+  if (unverified.length) {
+    parts.push("marked done but never verified: " + unverified.map(t => `[${t.id}] → run ${t.verify}`).join("; "));
+  }
+  return "NOT DONE YET. " + parts.join(". ") +
+    "\nFinish the remaining work now — do NOT restate the plan, do NOT ask the user to confirm. " +
+    "Batch all independent tool calls into a single response to keep round trips low, then call " +
+    "update_plan to reflect the new state. Only if a task is truly impossible, mark it blocked with a note.";
+}
+
 const TOOLS = [
   { type: "function", function: {
+      name: "update_plan",
+      description:
+        "Your goal + task list for the current request. Call it FIRST on any task that needs more than one step " +
+        "or any file change: state the goal in one sentence, then list every task with a `verify` that proves it works. " +
+        "Keep it in step with reality — flip a task to in_progress when you start it and to done the moment it is " +
+        "actually finished and verified. The user sees this list, and you are not allowed to stop while tasks are " +
+        "still pending. Send the COMPLETE list in `tasks` (full replace), or send just `updates` for a cheap " +
+        "status flip.",
+      parameters: { type: "object",
+        properties: {
+          goal: { type: "string", description: "One sentence: the outcome the user actually wants (not the steps)." },
+          tasks: { type: "array", description: "The COMPLETE ordered task list. 3-12 concrete tasks.",
+            items: { type: "object",
+              properties: {
+                id: { type: "string", description: "Stable short id, e.g. t1. Reuse it on later updates." },
+                content: { type: "string", description: "One concrete, verifiable step." },
+                status: { type: "string", enum: TASK_STATUS },
+                verify: { type: "string", description: "How to prove this task is done, e.g. 'npm test passes'." }
+              },
+              required: ["content", "status"] } },
+          updates: { type: "array", description: "Cheaper alternative to `tasks`: flip status on existing ids.",
+            items: { type: "object",
+              properties: {
+                id: { type: "string" },
+                status: { type: "string", enum: TASK_STATUS },
+                note: { type: "string", description: "Required when blocking/skipping: the reason." }
+              },
+              required: ["id", "status"] } }
+        } } } },
+  { type: "function", function: {
       name: "shell",
-      description: "Run a shell command; returns exit code + stdout/stderr. background=true for long-running processes (dev servers, watchers) so it returns immediately. Note: PowerShell is blocked; use cmd.",
+      description: "Run a shell command; returns exit code + stdout/stderr. background=true for long-running processes (dev servers, watchers) so it returns immediately. Combine independent commands with && or ; to save round trips. Note: PowerShell is blocked; use cmd.",
       parameters: { type: "object",
         properties: {
           command: { type: "string" },
@@ -189,10 +480,14 @@ const TOOLS = [
         required: ["command"] } } },
   { type: "function", function: {
       name: "read_file",
-      description: "Read a text file (path relative to project folder), optionally a line range. Prefer large meaningful chunks.",
+      description: "Read a text file (path relative to project folder), optionally a line range. Prefer large meaningful chunks. Pass `paths` (array) instead of `path` to read several files in ONE call.",
       parameters: { type: "object",
-        properties: { path: { type: "string" }, start: { type: "integer" }, end: { type: "integer" } },
-        required: ["path"] } } },
+        properties: {
+          path: { type: "string", description: "Single file to read." },
+          paths: { type: "array", items: { type: "string" }, description: "Several files at once — cheaper than one call per file." },
+          start: { type: "integer", description: "First line (1-based); only applies to `path`." },
+          end: { type: "integer", description: "Last line inclusive; only applies to `path`." }
+        } } } },
   { type: "function", function: {
       name: "str_replace",
       description: "Replace an exact, contiguous block of text in a file for targeted edits. `old_str` must match exactly (including whitespace).",
@@ -236,11 +531,15 @@ commands
   /set dir <path>         project folder ('-' to clear)      /cd <path>  same as /set dir
   /set context <n|auto>   context window; enables trimming ('auto' = detect from API)
   /set max_tokens <n>     reply length cap        /set maxout <n>  tool output cap (chars)
+  /set autoplan <on|off>  auto-derive goal + tasks from each prompt (default: on)
   /set max_steps <n>      tool-step cap (0 = unlimited; default)
   /set intercept <on|off> approval gate before mutating tools run
   /set tools <on|off>     enable/disable native function calling
   /set system <prompt>    replace system prompt
   /mode <ask|plan|code>   agent mode (ask=chat, plan=read-only plan, code=full auto)
+  /plan                   show the current goal + task checklist
+  /plan goal <text>       set a goal yourself (works even with autoplan off)
+  /plan clear             drop the current plan
   /redact <on|off>        toggle silent secret redaction (default: on)
   /compact                summarize & shrink history (use when context is getting full)
   /block <regex>  /unblock <regex>  /blocked     manage command blocklist
@@ -257,7 +556,10 @@ notes
   - MCP servers: edit ${MCP_PATH}
   - the agent stops after ${MAX_FAIL_STREAK} consecutive tool failures to avoid damage
   - loop detection: automatically stops if the model repeats the same output or tool calls
-  - tools: shell, read_file, str_replace, write_file, remember, forget, + MCP tools
+  - tools: update_plan, shell, read_file, str_replace, write_file, remember, forget, + MCP tools
+  - the agent sets a goal from your prompt, splits it into tasks, works them to done,
+    and refuses to stop while tasks are still open (follow-up nudge, max ${MAX_PLAN_NUDGES}x)
+    turn it off with /set autoplan off
   - env vars: AI_URL / AI_MODEL / AI_KEY / AI_DIR
 `;
 
@@ -272,6 +574,8 @@ usage: node ai-agent.mjs [options] ["one-shot prompt"]
   --context <n>       --maxout <n>        --max-tokens <n>
   --max-steps <n>     tool-step cap (0 = unlimited; default)
   --intercept         approval gate before mutating tools run
+  --autoplan <on|off>  auto-derive goal + tasks from the prompt (default: on)
+  --no-autoplan       same as --autoplan off
   --system <prompt>   --no-tools / --tools  --save   --list   -h`;
 
 // ------------------------------------------------------------------ ui/color
@@ -435,6 +739,7 @@ const READONLY = [
 function classifyTool(name, args) {
   if (mcpRegistry.has(name)) return "auto";
   if (name === "read_file") return "auto";
+  if (name === "update_plan") return "auto";   // planning is free — never gate it
   if (name === "shell") {
     const c = String(args.command || args._raw || "").trim();
     if (DANGEROUS.some(re => re.test(c))) return "block";
@@ -791,7 +1096,7 @@ function mcpPromptBlurb() {
 function loadCfg() {
   const cfg = { apiUrl: "", model: "", apiKey: "", context: 0, maxout: 10000,
                 maxTokens: 0, tools: true, system: "", timeout: 180, projectDir: "",
-                intercept: false, autoYes: false, maxSteps: 0,
+                intercept: false, autoYes: false, maxSteps: 0, autoPlan: true,
                 blockedCommands: DEFAULT_BLOCKED,
                 draftModel: "", temperature: null,
                 reasoning: "", redact: true, mode: "code" };
@@ -808,11 +1113,16 @@ const systemPrompt = (cfg, userPrompt = "") => {
   if (cfg.mode === "ask") {
     s = "You are an expert AI assistant. The user is in ASK mode. Answer questions directly and conversationally. Do NOT use any tools, do NOT read or write files, and do NOT execute commands. Just provide helpful text responses.";
   } else if (cfg.mode === "plan") {
-    s = "You are an expert autonomous software-engineering agent. The user is in PLAN mode. Your goal is to analyze the project and create a detailed, step-by-step plan to solve the user's task. You may use read-only tools (like read_file and shell for searching) to gather context, but DO NOT write, edit, or execute any mutating commands. Output a clear, actionable plan.";
+    s = "You are an expert autonomous software-engineering agent. The user is in PLAN mode. Analyze the project and turn the request into a concrete plan: state the goal in one sentence and break it into 3-12 verifiable tasks, recording them with `update_plan` (every task needs a `verify` check that would prove it works). Use read-only tools (read_file, shell for searching) to gather context, but DO NOT write, edit, or execute any mutating commands. Finish with a short readable summary of the plan.";
   } else {
     s = cfg.system || SYS_PROMPT;
   }
   s += `\nOperating system: ${osDescription()} · shell: ${SHELL_NAME}. Use ONLY commands valid for this OS and shell.`;
+  if (cfg.mode !== "ask") {
+    if (cfg.autoPlan === false && PLAN?.explicit !== true)
+      s += "\nPLANNING: auto-planning is OFF for this user. Do NOT call `update_plan` and do not write a task list — just do the work directly and reply concisely.";
+    s += planPromptBlock();
+  }
   s += mcpPromptBlurb();
   s += commandHints();
   const blocked = cfg.blockedCommands || DEFAULT_BLOCKED;
@@ -1212,7 +1522,19 @@ function truncate(s, cap) {
 }
 function fmtCall(name, args) {
   if (name === "shell") return "$ " + String(args.command || args._raw || "");
+  if (name === "update_plan") {
+    const bits = [];
+    if (args.goal) bits.push(`goal: ${String(args.goal).slice(0, 60)}`);
+    if (Array.isArray(args.tasks)) {
+      const done = args.tasks.filter(t => normalizeStatus(t?.status) === "done").length;
+      bits.push(`${args.tasks.length} tasks (${done} done)`);
+    }
+    if (Array.isArray(args.updates)) bits.push(args.updates.map(u => `${u.id}→${u.status}`).join(", "));
+    else if (args.id || args.task_id) bits.push(`${args.id || args.task_id}→${args.status}`);
+    return bits.join(" · ") || "(empty)";
+  }
   if (name === "read_file") {
+    if (Array.isArray(args.paths)) return `read ${args.paths.length} files: ${args.paths.join(", ")}`;
     let r = `read ${args.path || "?"}`;
     if (args.start || args.end) r += ` [${args.start || 1}-${args.end || "end"}]`;
     return r;
@@ -1273,8 +1595,28 @@ function runShell(cmd, timeoutSec, opts = {}, cfg = {}) {
     currentChild = child;
   });
 }
+function toolUpdatePlan(a, cfg) {
+  if (!a || (!Array.isArray(a.tasks) && !Array.isArray(a.updates) && !(a.id || a.task_id) && !a.goal))
+    return [false, "error: update_plan needs `tasks` (full list), or `updates`/`task_id`+`status` to change state"];
+  return applyPlanUpdate(a, cfg);
+}
 function toolRead(a, cfg) {
+  // `paths`: several files in ONE call — saves a round trip per file.
+  const many = Array.isArray(a.paths) ? a.paths.map(String).filter(Boolean) : [];
+  if (many.length) {
+    const cap = Math.max(2000, Math.floor((Number(cfg?.maxout) || 24000) / many.length));
+    const parts = [];
+    let allOk = true;
+    for (const p of many.slice(0, 12)) {
+      const [ok, txt] = toolRead({ path: p }, cfg);
+      if (!ok) allOk = false;
+      parts.push(`===== ${p} ${ok ? "" : "(FAILED)"} =====\n${ok ? txt.slice(0, cap) : txt}`);
+    }
+    if (many.length > 12) parts.push(`…and ${many.length - 12} more files not read (12 per call)`);
+    return [allOk, parts.join("\n\n")];
+  }
   const p = resolveP(a.path, cfg);
+  if (!String(a.path || "").trim()) return [false, "error: read_file needs `path` (one file) or `paths` (several)"];
   if (isProtectedPath(p)) return [false, `error: could not read file '${a.path}' (no such file)`];
   const fd = fs.openSync(p, "r");
   try {
@@ -1353,6 +1695,7 @@ async function runTool(name, args, cfg) {
       const { client, realName } = mcpRegistry.get(name);
       out = await client.callTool(realName, args, (cfg.timeout || 180) * 1000);
     }
+    else if (name === "update_plan") out = toolUpdatePlan(args, cfg);
     else if (name === "shell") out = await runShell(String(args.command || args._raw || ""), cfg.timeout || 180, { background: args.background, cwd: cfg.projectDir }, cfg);
     else if (name === "read_file") out = toolRead(args, cfg);
     else if (name === "str_replace") out = toolStrReplace(args, cfg);
@@ -1361,6 +1704,16 @@ async function runTool(name, args, cfg) {
     else if (name === "forget") out = toolForget(args);
     else return [false, `unknown tool '${name}'`];
     out[1] = maskSecrets(out[1], cfg);   // silent: real -> dummy before the model ever sees it
+    if (PLAN) {
+      PLAN.calls++;
+      if (name === "shell") {
+        const cmd = String(args.command || args._raw || "");
+        noteShellRan(cmd, !!out[0]);
+        if (!READONLY.some(re => re.test(cmd.trim()))) PLAN.mutations++;
+      } else if (name === "write_file" || name === "str_replace") {
+        PLAN.mutations++;
+      }
+    }
     return out;
   } catch (e) {
     return [false, `error: ${e.message}`];
@@ -1632,9 +1985,25 @@ async function agentTurn(cfg, history, keys) {
   if (cfg.tools) await ensureMcp();
   let tools = cfg.tools ? allTools() : [];
   if (cfg.mode === "ask") tools = [];
-  else if (cfg.mode === "plan") tools = tools.filter(t => ["read_file", "shell"].includes(t.function.name) || mcpRegistry.has(t.function.name));
+  else if (cfg.mode === "plan") tools = tools.filter(t => ["read_file", "shell", "update_plan"].includes(t.function.name) || mcpRegistry.has(t.function.name));
   const lastUserMsg = [...history].reverse().find(m => m.role === "user")?.content || "";
-  if (history[0]?.role === "system") history[0].content = systemPrompt(cfg, lastUserMsg);
+  // Auto-planning: derive a goal from the prompt and let the model decompose it into tasks.
+  // Switched off with /set autoplan off — but an explicit `/plan goal <text>` still opts in,
+  // so turning auto off does not lock you out of planning when you want it.
+  const auto = cfg.autoPlan !== false;
+  const wantPlan = cfg.mode !== "ask" && (auto || PLAN?.explicit === true);
+  const plan = wantPlan ? startPlanTurn(auto ? seedGoal(lastUserMsg) : "") : null;
+  if (!wantPlan) tools = tools.filter(t => t.function.name !== "update_plan");
+  const hasSystem = history[0]?.role === "system";
+  // Rebuilt on EVERY model call, not once per turn: the plan block has to track the live
+  // task state, otherwise the model sees the checklist it wrote at the start and stops
+  // following its own progress.
+  const refreshSystem = () => { if (hasSystem) history[0].content = systemPrompt(cfg, lastUserMsg); };
+  refreshSystem();
+  if (plan?.fresh) {
+    console.log(dim("⌾ goal: ") + dim(plan.goal));
+    plan.fresh = false; plan.announced = true;
+  }
 
   const limit = Number(cfg.maxSteps) || 0;
   let step = 0;
@@ -1643,6 +2012,7 @@ async function agentTurn(cfg, history, keys) {
   const recentToolSigs = [];     // track tool call signatures
   for (;;) {
     step++;
+    if (plan) plan.rounds = step;   // one model round trip per step
     if (limit > 0 && step > limit) {
       history.push({ role: "assistant", content: "(stopped: max tool steps reached)" });
       console.log(red(`! hit max tool steps (${limit}) — raise with /set max_steps <n>, or 0 for unlimited`));
@@ -1652,6 +2022,7 @@ async function agentTurn(cfg, history, keys) {
       console.log(dim(`… still working (${step} tool steps) — ctrl+c to stop`));
     }
 
+    refreshSystem();               // live goal + task state on every round trip
     trimHistory(history, cfg);
     const md = new MDStream();
     let shownThink = false, shownText = false, result = null;
@@ -1736,9 +2107,19 @@ async function agentTurn(cfg, history, keys) {
         result.content = stripToolMarkup(result.content);
       }
     }
-    if (!tcs.length) { // final message → done (1 round trip)
+    if (!tcs.length) { // final message → done (1 round trip), unless the plan says otherwise
+      const nudge = plan ? planGate() : null;
+      if (nudge) {
+        plan.nudges++;
+        history.push({ role: "assistant", content: result.content || "" });
+        history.push({ role: "user", content: nudge });
+        console.log(yellow(`! plan incomplete — following up (${plan.nudges}/${MAX_PLAN_NUDGES})`));
+        printPlan();
+        continue;
+      }
       history.push({ role: "assistant", content: result.content || "" });
       if (result.usage) showStats(cfg, history, result.usage);
+      printPlanSummary(plan);
       return;
     }
 
@@ -1825,11 +2206,15 @@ async function agentTurn(cfg, history, keys) {
         history.push({ role: "tool", tool_call_id: e.id, content: truncate(res, cfg.maxout) });
       }
 
+      // keep the user's checklist in view — after a plan update, or when a check cleared a flag
+      if (e.function.name === "update_plan" || plan?.dirty) { printPlan(); if (plan) plan.dirty = false; }
+
       if (failStreak >= MAX_FAIL_STREAK) {
         history.push({ role: "assistant", content:
           `I hit ${MAX_FAIL_STREAK} consecutive failures and stopped to avoid making things worse. ` +
           "Here's where I'm stuck — please tell me how you'd like to proceed." });
         console.log(red(`! ${MAX_FAIL_STREAK} consecutive tool failures — stopping to avoid damage`));
+        if (planOpen()) printPlan();
         return;
       }
     }
@@ -2116,7 +2501,33 @@ async function handleCommand(line, cfg, history, keys) {
     case "/help": case "/?":
       console.log(HELP.trim()); break;
     case "/clear": case "/reset":
-      history.length = 1; console.log(dim("history cleared")); break;
+      history.length = 1; resetPlan(); console.log(dim("history cleared")); break;
+    case "/plan": {
+      const sub = (k || "").toLowerCase();
+      if (sub === "clear" || sub === "reset") { resetPlan(); console.log(dim("plan cleared")); break; }
+      if (sub === "goal") {
+        if (!v) { console.log(dim("usage: /plan goal <one-sentence outcome>")); break; }
+        const p = ensurePlan();
+        p.goal = clean(v, 400);
+        p.explicit = true;   // user chose this goal, so it survives autoplan=off
+        p.announced = false; // show it on the next turn
+        console.log(dim("goal set — the model will plan against it from the next turn"));
+        if (cfg.autoPlan === false) console.log(dim("  (auto-planning is off; this explicit goal re-enables it)"));
+        break;
+      }
+      if (!PLAN || !PLAN.tasks.length) {
+        if (PLAN?.goal) console.log(dim("no tasks yet — goal: " + PLAN.goal));
+        else if (cfg.autoPlan === false)
+          console.log(dim("no active plan — auto-planning is off (/set autoplan on, or /plan goal <text>)"));
+        else console.log(dim("no active plan (the agent sets one from your prompt)"));
+        break;
+      }
+      console.log(renderPlan(PLAN, "  "));
+      const done = PLAN.tasks.filter(t => t.status === "done").length;
+      const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+      console.log(dim(`  ${done}/${PLAN.tasks.length} done · ${plural(PLAN.rounds, "round trip")} · ${plural(PLAN.calls, "tool call")}`));
+      break;
+    }
     case "/cd":
       setProjectDir(cfg, history, parts.slice(1).join(" "));
       break;
@@ -2268,6 +2679,7 @@ async function handleCommand(line, cfg, history, keys) {
         `\n  dir      ${cfg.projectDir ? displayPath(cfg.projectDir) : "(process cwd: " + displayPath(process.cwd()) + ")"}` +
         `\n  context  ${cfg.context || "not set (no trimming)"}\n  maxout   ${cfg.maxout}` +
         `   max_tokens ${cfg.maxTokens || "default"}\n  intercept ${cfg.intercept ? "on" : "off"}` +
+        `\n  autoplan ${cfg.autoPlan === false ? "off (no auto goal/tasks)" : "on (goal + tasks from prompt)"}` +
         `\n  max_steps ${cfg.maxSteps || "unlimited"}\n  blocked  ${(cfg.blockedCommands || DEFAULT_BLOCKED).length} pattern(s)` +
         `\n  mcp      ${mcpClients.size} server(s)\n  tools    ${cfg.tools ? "on" : "off"}` +
         `\n  data     ${DATA_DIR}`);
@@ -2321,9 +2733,21 @@ async function handleCommand(line, cfg, history, keys) {
           else if (["off","false","0","disable","disabled"].includes(t)) cfg.tools = false;
           else { console.log(dim("usage: /set tools <on|off>")); return true; }
         }
+        else if (k === "autoplan" || k === "auto_plan" || k === "plan") {
+          const t = (v || "").toLowerCase();
+          if (["on","true","1","enable","enabled"].includes(t)) cfg.autoPlan = true;
+          else if (["off","false","0","disable","disabled"].includes(t)) {
+            cfg.autoPlan = false;
+            resetPlan();   // drop any auto-derived goal so the change takes effect immediately
+          }
+          else { console.log(dim("usage: /set autoplan <on|off>")); return true; }
+          console.log(dim(cfg.autoPlan
+            ? "  goals + tasks are derived from your prompt automatically"
+            : "  no auto goal/tasks; set one yourself with /plan goal <text>"));
+        }
         else if (k === "max_steps") cfg.maxSteps = v ? parseInt(v, 10) : 0;
         else if (k === "system" && v) { cfg.system = v; if (history.length) history[0].content = systemPrompt(cfg); }
-        else { console.log(dim("usage: /set url|model|key|draft_model|temperature|reasoning|mode|redact|dir|context|max_tokens|maxout|intercept|tools|max_steps|system <value>")); return true; }
+        else { console.log(dim("usage: /set url|model|key|draft_model|temperature|reasoning|mode|redact|dir|context|max_tokens|maxout|intercept|tools|autoplan|max_steps|system <value>")); return true; }
         saveCfg(cfg);
         console.log(dim(`✓ ${k} updated`));
       } catch (e) { console.log(red(String(e.message))); }
@@ -2374,6 +2798,8 @@ function parseArgs(argv) {
       case "--reasoning": a.reasoning = next(); break;
       case "--mode": a.mode = next(); break;
       case "--intercept": case "-i": a.intercept = true; break;
+      case "--autoplan": case "--auto-plan": a.autoPlan = next(); break;
+      case "--no-autoplan": case "--no-auto-plan": a.autoPlan = "off"; break;
       case "--no-tools": a.noTools = true; break;
       case "--tools": a.tools = true; break;
       case "--list": a.list = true; break;
@@ -2411,6 +2837,7 @@ async function main() {
   if (args.draftModel) cfg.draftModel = args.draftModel;
   if (typeof args.temperature === "number" && !isNaN(args.temperature)) cfg.temperature = args.temperature;
   if (args.reasoning) cfg.reasoning = args.reasoning;
+  if (args.autoPlan) cfg.autoPlan = ["on","true","1"].includes(String(args.autoPlan).toLowerCase());
   if (args.mode) cfg.mode = args.mode;
   if (args.save) saveCfg(cfg);
 
@@ -2466,6 +2893,11 @@ async function main() {
     const t = line.trim();
     if (!t) continue;
     if (t.startsWith("/")) { if (!(await handleCommand(t, cfg, history, keys))) break; continue; }
+    // A closed-out plan belongs to the previous request — start the next one with a fresh goal.
+    // An unfinished plan is kept: the user is following up, and the agent must still close it out.
+    // An explicit goal with no tasks yet is also kept, so `/plan goal` survives until the turn
+    // that actually uses it instead of being discarded before the model ever sees it.
+    if (PLAN && !planOpen() && (PLAN.tasks.length || !PLAN.explicit)) resetPlan();
     const snap = history.length;
     history.push({ role: "user", content: t });
     try {
