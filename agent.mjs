@@ -3,6 +3,22 @@
  * ai-agent.mjs — minimal, fully-working, self-learning terminal AI agent.
  * Node >= 18, ZERO dependencies (stdlib only).
  *
+ * v2.14.0 — v2.13.0 + evidence-based planning (no more assumed tasks):
+ *   - A goal is now ANALYZED before tasks exist: the planner gets a real scan of the project
+ *     (file inventory, project manifests, grep hits for the goal's own key terms, and the content
+ *     of any file the goal names) instead of a bare folder listing.
+ *   - The planner may run its own READ-ONLY checks (read_file, shell with ls/cat/grep/find/rg/git)
+ *     for a few rounds before it must produce the plan; writing anything while planning is refused.
+ *     Read-only commands (grep/find/sed -n/…) no longer trip the plan-confirmation gate.
+ *   - It is told never to plan work that already exists: if the goal names something already
+ *     implemented (e.g. a search field in a form that has one), the tasks must describe the CHANGE
+ *     to that real file/symbol. It must record what it relied on in `findings`, which are shown
+ *     under the checklist and in the model's system prompt.
+ *   - After drafting, the tasks are AUDITED against the same facts; a list that assumes existing
+ *     (or non-existent) work is re-planned once, and anything still doubtful is flagged to the user.
+ *   - `--plan-goal <text>` runs the same analysis non-interactively (tasks drafted, then the run
+ *     starts after the plan is shown).
+ *
  * v2.13.0 — v2.12.0 + goal planning with confirmation:
  *   - `/plan goal <text>` now analyzes the goal immediately and drafts 3-12
  *     verifiable tasks via a focused planner call (with a starter-task fallback
@@ -78,7 +94,7 @@ import { exec, spawn } from "node:child_process";
 import process from "node:process";
 import { EventSource } from "eventsource";
 
-const VERSION = "2.13.0";
+const VERSION = "2.14.0";
 
 // ------------------------------------------------------------------ data folder
 const DATA_DIR = path.join(os.homedir(), ".aiterm");
@@ -139,7 +155,7 @@ const SYS_PROMPT =
   "\n" +
   "WORK METHOD — goal, then tasks, then execution, then proof:\n" +
   "1. SET THE GOAL: restate the user's prompt as one sentence describing the OUTCOME they want (not the steps). That sentence goes into `update_plan`.\n" +
-  "2. PLAN AS TASKS: for any request needing >1 step or any file change, call `update_plan` FIRST with the goal and 3-12 concrete, individually verifiable tasks. Give each task a `verify` — the command or check that proves it works. Skip the plan only for a pure question or a single trivial edit.\n" +
+  "2. INVESTIGATE, THEN PLAN: before writing any task, find out what ALREADY EXISTS — read the files the request names and search the code for its key terms (read_file with `paths`, shell with grep/find/rg). Never assume: a task that creates/adds something that is already implemented is a bug. Then call `update_plan` with the goal (one sentence), `findings` (the real files/facts you relied on) and 3-12 concrete, individually verifiable tasks that name the real files/symbols you found — each with a `verify` (the command or check that proves it works). Skip the plan only for a pure question or a single trivial edit.\n" +
   "3. UNDERSTAND FIRST: infer the project type (language, framework, libraries) from the task and files. Explore before changing. Never assume — gather context, then act.\n" +
   "4. WORK ONE TASK AT A TIME: mark it in_progress, do it, verify it, mark it done, then move to the next. Update the plan as you go so the list always matches reality.\n" +
   "5. MINIMISE ROUND TRIPS: issue every independent tool call in ONE response — read all the files you need together (or pass `paths` to read_file), run exploration commands chained with && , and never make a call whose result you could have obtained in the same batch. Do not re-read a file you just wrote, and do not re-run a command that already succeeded.\n" +
@@ -243,6 +259,7 @@ function newPlan(goal = "") {
     touched: false,          // model called update_plan during this turn
     dirty: false,            // checklist changed outside update_plan — needs a reprint
     explicit: false,         // user set this goal via /plan goal — survives autoplan=off
+    findings: [],            // evidence the tasks are based on (what already exists / must change)
     announced: false,        // goal already shown to the user for this plan
     confirmed: false,           // user approved this task list (explicit goals pause until they do)
     sinceUpdate: { shell: 0 },
@@ -376,6 +393,9 @@ function applyPlanUpdate(a, cfg) {
     if (u.verify) t.verify = clean(u.verify, 160);
   }
 
+  if (Array.isArray(a?.findings))
+    p.findings = a.findings.map(f => clean(typeof f === "string" ? f : (f?.fact ?? f?.evidence ?? f?.note ?? f?.content), 200))
+      .filter(Boolean).slice(0, 6);
   if (String(a?.goal || "").trim()) p.goal = clean(a.goal, 400);
   const done = p.tasks.filter(t => t.status === "done").length;
   const open = activeTasks(p).length;
@@ -394,6 +414,7 @@ function renderPlan(p = PLAN, prefix = "  ") {
   if (!p.tasks.length) return p.goal ? `${prefix}GOAL: ${p.goal}   [no tasks yet]` : "";
   const done = p.tasks.filter(t => t.status === "done").length;
   const lines = [`${prefix}GOAL: ${p.goal || "(unset)"}   [${done}/${p.tasks.length} done]`];
+  for (const f of (p.findings || []).slice(0, 4)) lines.push(`${prefix} based on: ${f}`);
   for (const t of p.tasks) {
     let l = `${prefix} ${PLAN_ICON[t.status] || "?"} [${t.id}] ${t.content}`;
     if (t.status === "done" && t.verify) l += t.unverified ? `  (verify PENDING: ${t.verify})` : `  (verified: ${t.verify})`;
@@ -459,8 +480,9 @@ function planGate() {
       ? `the user set an explicit goal ("${p.goal || "(unset)"}") but there are no tasks yet`
       : `you already changed files ${p.mutations}x without any task list`;
     return "NO PLAN YET. " + why + ". " +
-      "Call update_plan NOW with the goal in one sentence and 3-12 concrete tasks " +
-      "(each with a `verify` check that proves it works), then continue the work. " +
+      "Call update_plan NOW with the goal in one sentence, the `findings` you actually verified " +
+      "about the existing code, and 3-12 concrete tasks (each with a `verify` check that proves it " +
+      "works) that name the real files — never plan work that already exists. " +
       "Do NOT ask the user anything — just create the list and keep going.";
   }
   if (!p.armed) return null;
@@ -480,90 +502,438 @@ function planGate() {
     "update_plan to reflect the new state. Only if a task is truly impossible, mark it blocked with a note.";
 }
 
-// ------------------------------------------------------------------ goal planner
-// Turns a user-set goal into a draft task list with ONE focused model call, so a goal
-// NEVER sits task-less waiting for the model to volunteer update_plan (the old bug:
-// tasks were only created when the model felt like calling the tool). Always returns
-// 3+ tasks — if the model call fails or returns nothing usable, deterministic starter
-// tasks are used instead so the user still gets something to review and edit.
+// ------------------------------------------------------------------ goal planner (evidence-based)
+// Planning used to see only the goal plus a flat file listing, so it invented work — e.g. it
+// asked to "create a search field" in a form that already had one. Planning now starts with a
+// deterministic scan of the project (file inventory, manifests, grep hits for the goal's own key
+// terms, and the content of any file the goal names), then lets the planner run its own READ-ONLY
+// checks before it writes anything. Whatever already exists is therefore visible BEFORE a task is
+// invented, and a draft that still assumes non-existent (or already-existing) work is audited
+// against those facts and re-planned once.
+const RECON_SKIP = new Set(["node_modules", ".git", "dist", "build", "out", "coverage", ".next", ".nuxt",
+  ".svelte-kit", ".venv", "venv", "__pycache__", ".cache", ".parcel-cache", ".turbo", ".pytest_cache",
+  ".mypy_cache", ".ruff_cache", "vendor", "target", ".gradle", ".idea", ".vscode", "Pods", "bin", "obj"]);
+const RECON_MAX_FILES = 500;     // files visited by the scan
+const RECON_MAX_HITS = 40;       // evidence lines kept
+const RECON_FILE_BYTES = 400_000;
+const RECON_KEYWORDS = 8;
+const PLANNER_MAX_ROUNDS = 4;    // read-only investigation rounds before the plan must be produced
+const PLANNER_OUT_CHARS = 6000;  // cap on each investigation result handed back to the planner
+const CODE_EXT = /\.(m?[jt]sx?|cjs|py|rb|go|rs|java|kt|swift|php|cs|cpp|cc|h|hpp|css|scss|sass|less|html|vue|svelte|json|ya?ml|toml|md|sh|bash|sql|xml|txt)$/i;
+// Words that carry no signal when searching a codebase for the goal's subject matter.
+const PLAN_STOPWORDS = new Set(("a an the this that these those and or but if then than so to of in on at for from with without " +
+  "into onto over under about as by is are was were be been being do does did done can could should would will shall may might must " +
+  "i me my we our you your it its they them their he she his her there here what which who whom when where why how " +
+  "add create created creates creating make makes made build builds built implement implements implemented implementation " +
+  "support supports supported allow allows allows enable enables enabled new newly existing exists exist already currently current " +
+  "feature features functionality function functions ability option options option allow please want wants wanted need needs needed " +
+  "should must also only just very more most less least other others same different same like such using use used uses user users " +
+  "code file files folder project app application page pages screen screens thing things work works working task tasks step steps " +
+  "change changes changed update updates updated fix fixes fixed remove removes removed delete deletes deleted improve improves " +
+  "refactor refactors refactoring let me my our its when while keep keeps keeping give gives given get gets got set sets setting " +
+  "still now then first next last last before after again both each every some any all not no yes ok okay please thanks thank " +
+  "instead either whether does not dont doesn't cant can't won't").split(/\s+/));
+
+// Small deterministic walk of the project (skips VCS/build/venv noise and dotfiles, which also keeps
+// .env-style secrets out of the model prompt).
+function reconWalk(base, limit = RECON_MAX_FILES) {
+  const files = [];
+  const queue = [["", 0]];
+  let truncated = false;
+  while (queue.length) {
+    const [rel, depth] = queue.shift();
+    if (depth > 6) continue;
+    let entries;
+    try { entries = fs.readdirSync(path.join(base, rel), { withFileTypes: true }); }
+    catch { continue; }
+    for (const e of entries) {
+      if (files.length >= limit) { truncated = true; break; }
+      if (e.name.startsWith(".")) continue;
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) { if (!RECON_SKIP.has(e.name)) queue.push([r, depth + 1]); }
+      else if (e.isFile()) files.push(r);
+    }
+    if (files.length >= limit) truncated = true;
+  }
+  return { files, truncated };
+}
+
+function goalKeywords(text) {
+  const toks = String(text || "").toLowerCase().match(/[a-z0-9][a-z0-9_-]{2,}/g) || [];
+  const out = [];
+  for (const t of toks) {
+    if (PLAN_STOPWORDS.has(t) || /^\d+$/.test(t) || out.includes(t)) continue;
+    out.push(t);
+    if (out.length >= RECON_KEYWORDS) break;
+  }
+  return out;
+}
+
+// Files the goal itself names ("add validation to src/Form.jsx") — read them so the plan is based
+// on their real content instead of an assumption about it.
+function goalFileHints(goal) {
+  const out = [];
+  const re = /[\w./\\-]+\.(?:m?[jt]sx?|cjs|py|rb|go|rs|java|kt|swift|php|cs|cpp|h|css|scss|less|html|vue|svelte|json|ya?ml|toml|md|sh|sql)\b/gi;
+  for (const m of String(goal || "").match(re) || []) {
+    const p = m.replace(/^\.?\//, "");
+    if (!out.includes(p)) out.push(p);
+    if (out.length >= 2) break;
+  }
+  return out;
+}
+
+// Real matches for the goal's terms, so "search" in the goal turns into "src/Form.jsx:42 already
+// has name=\"search\"" instead of a guessed task.
+function scanGoalTerms(base, files, keywords) {
+  const hits = [], named = new Set();
+  const counts = new Map(keywords.map(k => [k, 0]));
+  for (const f of files) {
+    const low = path.basename(f).toLowerCase();
+    if (keywords.some(k => low.includes(k))) named.add(f);
+  }
+  for (const f of files) {
+    if (hits.length >= RECON_MAX_HITS) break;
+    if (!CODE_EXT.test(f)) continue;
+    const abs = path.join(base, f);
+    let st; try { st = fs.statSync(abs); } catch { continue; }
+    if (!st.isFile() || st.size > RECON_FILE_BYTES) continue;
+    let text; try { text = fs.readFileSync(abs, "utf8"); } catch { continue; }
+    if (text.includes("\u0000")) continue;
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length && hits.length < RECON_MAX_HITS; i++) {
+      const low = lines[i].toLowerCase();
+      for (const k of keywords) {
+        if (counts.get(k) >= 8 || !low.includes(k)) continue;
+        counts.set(k, counts.get(k) + 1);
+        hits.push({ term: k, file: f, line: i + 1, text: lines[i].replace(/\s+/g, " ").trim().slice(0, 140) });
+        break;
+      }
+    }
+  }
+  return { hits, counts, named: [...named].slice(0, 10) };
+}
+
+function buildRecon(cfg, goal) {
+  const base = cfg.projectDir || process.cwd();
+  const rec = { base, goal: String(goal || ""), files: [], truncated: false, keywords: [], hits: [],
+                counts: new Map(), named: [], manifests: [], goalFiles: [] };
+  try {
+    const w = reconWalk(base);
+    rec.files = w.files;
+    rec.truncated = w.truncated;
+  } catch {}
+  rec.keywords = goalKeywords(goal);
+  try {
+    const s = scanGoalTerms(base, rec.files, rec.keywords);
+    rec.hits = s.hits; rec.counts = s.counts; rec.named = s.named;
+  } catch {}
+  // Manifests: real script/test commands, framework and dependency names — so `verify` fields can
+  // quote commands that actually exist in this project.
+  for (const name of ["package.json", "pyproject.toml", "requirements.txt", "go.mod", "Cargo.toml", "Makefile", "composer.json", "Gemfile"]) {
+    const abs = path.join(base, name);
+    try {
+      const st = fs.statSync(abs);
+      if (!st.isFile() || st.size > 200_000) continue;
+      let body = fs.readFileSync(abs, "utf8");
+      if (name === "package.json") {
+        const j = tryParse(body);
+        if (j) body = JSON.stringify({ name: j.name, scripts: j.scripts,
+          dependencies: Object.keys(j.dependencies || {}), devDependencies: Object.keys(j.devDependencies || {}) }, null, 1);
+      }
+      rec.manifests.push({ name, body: body.slice(0, 1500) });
+      if (rec.manifests.length >= 2) break;
+    } catch {}
+  }
+  for (const rel of goalFileHints(goal)) {
+    const abs = path.resolve(base, rel);
+    if (!abs.startsWith(path.resolve(base) + path.sep)) continue;
+    try {
+      const st = fs.statSync(abs);
+      if (!st.isFile() || st.size > RECON_FILE_BYTES) continue;
+      const body = fs.readFileSync(abs, "utf8");
+      if (body.includes("\u0000")) continue;
+      rec.goalFiles.push({ path: rel, body: body.split("\n").slice(0, 200).join("\n").slice(0, 4000) });
+      if (rec.goalFiles.length >= 2) break;
+    } catch {}
+  }
+  return rec;
+}
+
+function formatRecon(rec) {
+  const L = [`Project folder: ${rec.base}`];
+  const top = [...new Set(rec.files.map(f => (f.includes("/") ? f.split("/")[0] + "/" : "(root files)")))];
+  L.push(`File inventory (${rec.files.length}${rec.truncated ? "+" : ""} files) in: ${top.slice(0, 12).join(", ") || "(empty project)"}`);
+  if (rec.files.length) L.push(`Files: ${rec.files.slice(0, 160).join(", ")}${rec.files.length > 160 ? ", …" : ""}`);
+  for (const m of rec.manifests) L.push(`Project manifest ${m.name}:\n${m.body}`);
+  if (rec.keywords.length) {
+    L.push(`Matches for the goal's key terms (real, case-insensitive search of the code above):`);
+    for (const k of rec.keywords) {
+      const n = rec.counts.get(k) || 0;
+      const ex = rec.hits.filter(h => h.term === k).slice(0, 4).map(h => `\n      ${h.file}:${h.line}: ${h.text}`).join("");
+      L.push(`  "${k}": ${n ? `${n} match(es) — already present in the code` : "no match — not implemented yet"}${ex}`);
+    }
+  }
+  if (rec.named.length)
+    L.push(`Files whose NAME matches a goal term (strong sign this already exists): ${rec.named.join(", ")}`);
+  for (const g of rec.goalFiles)
+    L.push(`--- current content of ${g.path} (named in the goal; first 200 lines) ---\n${g.body}`);
+  return L.join("\n");
+}
+
+function plannerSystem() {
+  return "You are the planner for an autonomous coding agent. You decide WHAT must change; you " +
+    "never change anything yourself — planning is strictly READ-ONLY.\n" +
+    "RULES:\n" +
+    "- The PROJECT FACTS below were produced by reading this project. Treat them as truth.\n" +
+    "- Never assume: do NOT invent file names, symbols, libraries, endpoints or behaviour you have " +
+    "not seen. If the facts leave something unclear, investigate it yourself with read-only tools " +
+    "(read_file, or shell using ls/cat/grep/find/rg/git status/diff) BEFORE you plan.\n" +
+    "- NEVER create a task to create/add/build/implement something the facts show already exists. " +
+    "If the goal names something that is already implemented, the task must describe the CHANGE to " +
+    "that real code and name its actual file/symbol (e.g. 'extend the existing search input in " +
+    "src/Form.jsx', not 'create a search field').\n" +
+    "- Every task must be concrete, ordered, individually verifiable, and grounded in evidence; the " +
+    "`verify` field must be a command/check that actually works in this project.\n" +
+    "- Put the facts you relied on in `findings` (what already exists, what must change, real paths).\n" +
+    "When your investigation is complete, call `update_plan` exactly once with goal, findings and " +
+    "3-12 tasks (id, content, status \"pending\", verify). Call no other tool after that.";
+}
+
+function plannerUser(goal, rec) {
+  return `GOAL: ${goal}\n\n=== PROJECT FACTS (scanned from disk, verified) ===\n${formatRecon(rec)}\n` +
+    "=== END PROJECT FACTS ===\n\n" +
+    "Investigate further only where these facts are insufficient, then call `update_plan` once with " +
+    "the goal, `findings`, and 3-12 tasks that describe the real changes to the real code. " +
+    "Do not write a task for anything the facts show already exists.";
+}
+
+function plannerFindings(args) {
+  const raw = Array.isArray(args?.findings) ? args.findings : [];
+  return raw
+    .map(f => clean(typeof f === "string" ? f : (f?.fact ?? f?.evidence ?? f?.note ?? f?.content), 200))
+    .filter(Boolean).slice(0, 6);
+}
+
+function parsePlannerCall(tc, goal) {
+  const args = tryParse(tc.arguments);
+  if (!args || !Array.isArray(args.tasks) || !args.tasks.length) return null;
+  const tasks = args.tasks.slice(0, MAX_PLAN_TASKS).map((t, i) => normalizeTask(t, i, null)).filter(t => t.content);
+  if (!tasks.length) return null;
+  return { tasks, goal: clean(args.goal, 400) || goal, findings: plannerFindings(args), source: "llm" };
+}
+
+function extractJsonObject(text) {
+  const s = String(text || "").trim();
+  const candidates = [s];
+  const greedy = s.match(/\{[\s\S]*\}/);
+  if (greedy && greedy[0] !== s) candidates.push(greedy[0]);
+  for (const c of candidates) {
+    const o = tryParse(c);
+    if (o && typeof o === "object") return o;
+  }
+  return null;
+}
+
+// Planning-time tool executor: read-only, capped, secret-masked, and never counted as agent work.
+async function runPlannerTool(name, args, cfg) {
+  try {
+    if (name === "read_file") {
+      const [ok, text] = toolRead(args, cfg);
+      return [ok, maskSecrets(truncate(String(text), PLANNER_OUT_CHARS), cfg)];
+    }
+    const cmd = String(args.command || args._raw || "").trim();
+    if (!cmd) return [false, "error: shell needs a `command`"];
+    if (isPlanMutating("shell", args))
+      return [false, "error: planning is READ-ONLY — you cannot modify files or run changing commands " +
+                     "while planning. Describe the change as a task instead."];
+    const [ok, text] = await runShell(cmd, Math.min(60, cfg.timeout || 60), { cwd: cfg.projectDir }, cfg);
+    return [ok, maskSecrets(truncate(String(text), PLANNER_OUT_CHARS), cfg)];
+  } catch (e) {
+    return [false, `error: ${e.message}`];
+  }
+}
+
+// The planner gets a few rounds of read-only investigation; the plan itself must arrive through
+// update_plan (or JSON for endpoints without tool support).
+async function plannerToolLoop(cfg, goal, rec, messages, tools, planTool) {
+  for (let round = 0; round <= PLANNER_MAX_ROUNDS; round++) {
+    const last = round === PLANNER_MAX_ROUNDS;
+    const askTools = last ? (planTool ? [planTool] : []) : tools;
+    if (!askTools.length) return null;
+    if (last) messages.push({ role: "user", content:
+      "Stop investigating now. Call `update_plan` with the goal, findings and 3-12 grounded tasks." });
+    let result = null;
+    for await (const ev of streamChat(cfg, messages, askTools, null)) if (ev.type === "end") result = ev.result;
+    const planned = (result?.toolCalls || []).find(t => t.name === "update_plan");
+    if (planned) {
+      const parsed = parsePlannerCall(planned, goal);
+      if (parsed) return parsed;
+    }
+    const probes = (result?.toolCalls || []).filter(t => t.name === "read_file" || t.name === "shell");
+    if (!probes.length || last) return null;
+    messages.push({ role: "assistant", content: result.content || null,
+      tool_calls: probes.map((t, i) => ({ id: t.id || `plan_${round}_${i}`, type: "function",
+        function: { name: t.name, arguments: t.arguments || "{}" } })) });
+    for (const [i, t] of probes.entries()) {
+      const args = tryParse(t.arguments) ?? { _raw: t.arguments };
+      const [ok, text] = await runPlannerTool(t.name, args, cfg);
+      console.log(dim("  ⌕ " + fmtCall(t.name, args) + (ok ? "" : "  (refused)")));
+      messages.push({ role: "tool", tool_call_id: t.id || `plan_${round}_${i}`, content: text });
+    }
+  }
+  return null;
+}
+
+// Single request that accepts EITHER an update_plan call or a plain JSON plan — used for endpoints
+// that reject tools, for the final attempt, and for the re-plan after an audit.
+async function oneShotPlan(cfg, goal, rec, note = "") {
+  const planTool = TOOLS.find(t => t.function.name === "update_plan");
+  const sys = plannerSystem() + "\nReply with ONE JSON object only, no prose and no markdown: " +
+    "{\"goal\":\"...\",\"findings\":[\"fact\",...],\"tasks\":[{\"id\":\"t1\",\"content\":\"...\"," +
+    "\"status\":\"pending\",\"verify\":\"...\"}]} — or call `update_plan` with the same fields.";
+  const user = plannerUser(goal, rec) + (note ? "\n\n" + note : "");
+  const attempt = async (tools) => {
+    let result = null;
+    for await (const ev of streamChat(cfg, [{ role: "system", content: sys }, { role: "user", content: user }], tools, null))
+      if (ev.type === "end") result = ev.result;
+    return result;
+  };
+  let result = null, toolError = null;
+  try {
+    result = await attempt(planTool ? [planTool] : []);
+  } catch (e) {
+    if (!/tool|function/i.test(String(e?.message || e))) throw e;
+    toolError = e;
+    result = await attempt([]);
+  }
+  const tc = (result?.toolCalls || []).find(t => t.name === "update_plan");
+  const fromTool = tc ? parsePlannerCall(tc, goal) : null;
+  if (fromTool) return fromTool;
+  const obj = extractJsonObject(result?.content);
+  if (obj && Array.isArray(obj.tasks) && obj.tasks.length) {
+    const tasks = obj.tasks.slice(0, MAX_PLAN_TASKS).map((t, i) => normalizeTask(t, i, null)).filter(t => t.content);
+    if (tasks.length) return { tasks, goal: clean(obj.goal, 400) || goal, findings: plannerFindings(obj), source: "llm-json" };
+  }
+  if (toolError) throw toolError;
+  return null;
+}
+
+// Second opinion against the same facts: does any draft task ask for work that already exists (or
+// contradict the scan)? Fails open — a broken audit must never block planning.
+async function auditTasks(cfg, goal, tasks, rec) {
+  const sys = "You audit a coding task list against FACTS scanned from the project. Flag a task ONLY " +
+    "when the facts prove it unsound: it creates/adds/builds something the facts show already exists, " +
+    "contradicts a fact (wrong path, wrong symbol, behaviour that is already there), or cannot be " +
+    "verified at all. Be strict about evidence and lenient about wording. Reply with JSON only: " +
+    "{\"invalid\":[{\"id\":\"t1\",\"why\":\"...\"}]} — an empty array when every task is grounded.";
+  const user = `GOAL: ${goal}\n\n=== PROJECT FACTS ===\n${formatRecon(rec)}\n=== END FACTS ===\n\n` +
+    "DRAFT TASKS:\n" +
+    tasks.map(t => `[${t.id}] ${t.content}${t.verify ? `  (verify: ${t.verify})` : ""}`).join("\n") +
+    "\n\nReply with the JSON object only.";
+  let result = null;
+  for await (const ev of streamChat(cfg, [{ role: "system", content: sys }, { role: "user", content: user }], [], null))
+    if (ev.type === "end") result = ev.result;
+  const obj = extractJsonObject(result?.content);
+  const bad = Array.isArray(obj?.invalid) ? obj.invalid : [];
+  const ids = new Set(tasks.map(t => t.id));
+  return bad
+    .map(b => (typeof b === "string" ? { id: b, why: "" } : { id: String(b?.id ?? b?.task_id ?? ""), why: clean(b?.why ?? b?.reason ?? b?.note, 160) }))
+    .filter(b => ids.has(b.id))
+    .slice(0, 6);
+}
+
+// Deterministic last resort so a goal can never sit task-less; it assumes nothing about the project
+// beyond "look before you change".
 function starterTasksFor(goal) {
   const g = String(goal || "the goal").replace(/\s+/g, " ").trim().slice(0, 120) || "the goal";
   return [
-    { id: "t1", content: `Explore the relevant code for: ${g}`, status: "pending", verify: "relevant files identified" },
-    { id: "t2", content: `Implement: ${g}`, status: "pending", verify: "changes applied and app still runs" },
-    { id: "t3", content: "Verify with build/tests", status: "pending", verify: "build/tests pass" },
+    { id: "t1", content: `Inspect the existing code related to: ${g}`, status: "pending", verify: "relevant files read and current behaviour understood" },
+    { id: "t2", content: `Implement the change for: ${g} (extending existing code, not duplicating it)`, status: "pending", verify: "changes applied and the app still runs" },
+    { id: "t3", content: "Verify with the project's build/tests", status: "pending", verify: "build/tests pass" },
   ];
 }
 
 async function generateTasksForGoal(cfg, goal) {
-  const fallback = (error) => ({ tasks: starterTasksFor(goal), goal, source: "fallback", error });
-  let listing = "";
-  try {
-    const base = cfg.projectDir || process.cwd();
-    listing = fs.readdirSync(base, { withFileTypes: true }).slice(0, 40)
-      .map(e => (e.isDirectory() ? e.name + "/" : e.name)).join(", ");
-  } catch {}
-  const plannerSys =
-    "You are a planner for an autonomous coding agent. Decompose the user's GOAL into " +
-    "3-12 concrete, ordered, individually verifiable tasks. Call the update_plan tool " +
-    "exactly once with the goal (one sentence: the outcome the user wants) and the full " +
-    "task list; every task needs id (t1, t2, ...), content (one concrete step), status " +
-    "\"pending\", and verify (the command or check that proves it works). Do not do the " +
-    "work yourself and do not call any other tool.";
-  const plannerUser =
-    `GOAL: ${goal}\n` +
-    `Project folder: ${cfg.projectDir || process.cwd()}\n` +
-    `Top-level files: ${listing || "(unknown)"}\n\n` +
-    "Reply ONLY via the update_plan tool call.";
+  const rec = buildRecon(cfg, goal);
+  const fallback = (error) => ({ tasks: starterTasksFor(goal), goal, findings: [], source: "fallback", error, recon: rec });
   const planTool = TOOLS.find(t => t.function.name === "update_plan");
-  let result = null;
-  spin.start("planning…");
+  const readTools = TOOLS.filter(t => t.function.name === "read_file" || t.function.name === "shell");
+  const tools = planTool ? [...readTools, planTool] : [...readTools];
+  const messages = [
+    { role: "system", content: plannerSystem() },
+    { role: "user", content: plannerUser(goal, rec) },
+  ];
+  spin.start("analyzing the project…");
+  let plan = null;
   try {
     try {
-      for await (const ev of streamChat(cfg,
-        [{ role: "system", content: plannerSys }, { role: "user", content: plannerUser }],
-        planTool ? [planTool] : [], null)) {
-        if (ev.type === "end") result = ev.result;
-      }
+      plan = await plannerToolLoop(cfg, goal, rec, messages, tools, planTool);
     } catch (e) {
-      // Endpoint rejects tools (plain-chat server): retry without tools and parse JSON.
-      if (planTool && /tool|function/i.test(String(e?.message || e))) {
-        result = null;
-        for await (const ev of streamChat(cfg,
-          [{ role: "system", content: plannerSys + " Reply with a single JSON object ONLY: {\"goal\": \"...\", \"tasks\": [{\"id\": \"t1\", \"content\": \"...\", \"status\": \"pending\", \"verify\": \"...\"}]}. No other text." },
-           { role: "user", content: plannerUser }],
-          [], null)) {
-          if (ev.type === "end") result = ev.result;
-        }
-      } else throw e;
+      // Endpoint rejects tools (plain-chat server): fall through to the JSON planner.
+      if (!/tool|function/i.test(String(e?.message || e))) { spin.stop(); return fallback(String(e?.message || e)); }
     }
+    if (!plan) plan = await oneShotPlan(cfg, goal, rec);
   } catch (e) {
     spin.stop();
     return fallback(String(e?.message || e));
   }
+  if (!plan) { spin.stop(); return fallback(""); }
+  // Audit the draft against the evidence and rewrite once if it invented something.
+  try {
+    const bad = await auditTasks(cfg, goal, plan.tasks, rec);
+    if (bad.length) {
+      console.log(yellow("! the draft plan does not match the project:"));
+      for (const b of bad) console.log(dim(`    [${b.id}] ${b.why || "assumes work that already exists"}`));
+      console.log(dim("  revising the tasks against what the scan found…"));
+      const fixed = await oneShotPlan(cfg, goal, rec,
+        "A previous draft was rejected by an audit of the PROJECT FACTS. Fix EVERY item below, then " +
+        "call `update_plan` once with the corrected list:\n" +
+        bad.map(b => `- [${b.id}] ${b.why || "assumes work that already exists"}`).join("\n"));
+      if (fixed) plan = fixed;
+      else plan.flags = bad.map(b => `[${b.id}] ${b.why || "assumes work that already exists"}`);
+    }
+  } catch {}
   spin.stop();
-  // 1. preferred: a real update_plan tool call
-  const tc = (result?.toolCalls || []).find(t => t.name === "update_plan");
-  if (tc) {
-    try {
-      const args = JSON.parse(tc.arguments);
-      if (Array.isArray(args.tasks) && args.tasks.length)
-        return { tasks: args.tasks, goal: String(args.goal || goal), source: "llm" };
-    } catch {}
+  return { ...plan, recon: rec };
+}
+
+// ------------------------------------------------------------------ /plan goal (+ --plan-goal)
+// Shared by `/plan goal <text>` and `--plan-goal <text>`: set an explicit goal, analyze the project
+// for what already exists, draft evidence-based tasks, and show the checklist for review.
+async function applyGoal(cfg, goal, opts = {}) {
+  const p = ensurePlan();
+  if (p.tasks.length && planOpen(p))
+    console.log(yellow(`! replacing the previous plan (${planOpen(p)} open task(s) discarded)`));
+  p.goal = clean(goal, 400);
+  p.explicit = true;    // user chose this goal, so it survives autoplan=off
+  p.announced = false;  // show it on the next turn
+  p.confirmed = false;
+  console.log(dim("goal set — analyzing the project before planning…"));
+  const gen = await generateTasksForGoal(cfg, p.goal);
+  applyPlanUpdate({ goal: gen.goal || p.goal, tasks: gen.tasks, findings: gen.findings || [] }, cfg);
+  p.confirmed = false;   // a fresh list always needs a review before it runs
+  p.announced = false;
+  const rec = gen.recon || {};
+  const bits = [];
+  if (rec.files?.length) bits.push(`${rec.files.length}${rec.truncated ? "+" : ""} project files scanned`);
+  if (rec.goalFiles?.length) bits.push(`read ${rec.goalFiles.map(f => f.path).join(", ")}`);
+  const found = (rec.keywords || []).filter(k => (rec.counts?.get?.(k) || 0) > 0);
+  if (found.length) bits.push(`existing: ${found.map(k => `${k}×${rec.counts.get(k)}`).join(", ")}`);
+  if (bits.length) console.log(dim("  ⌕ " + bits.join(" · ")));
+  printPlan();
+  if (gen.source === "fallback") {
+    console.log(yellow("! the planner did not return tasks — starter tasks created instead."));
+    if (gen.error) console.log(dim(`  (planner error: ${gen.error})`));
   }
-  // 2. plain-JSON reply (tool-less endpoint or chatty model): extract {"tasks": [...]}
-  const content = String(result?.content || "").trim();
-  const candidates = [content];
-  const greedy = content.match(/\{[\s\S]*\}/);
-  if (greedy && greedy[0] !== content) candidates.push(greedy[0]);
-  for (const c of candidates) {
-    try {
-      const obj = JSON.parse(c);
-      if (obj && Array.isArray(obj.tasks) && obj.tasks.length)
-        return { tasks: obj.tasks, goal: String(obj.goal || goal), source: "llm-json" };
-    } catch {}
+  if (gen.flags?.length) {
+    console.log(yellow("! these tasks may still assume work that already exists:"));
+    for (const f of gen.flags) console.log(dim("    " + f));
   }
-  return fallback("");
+  if (opts.hints === false) return gen;
+  console.log(dim("  review with /plan · edit with /plan add|edit|del|verify|status · then send a message to start"));
+  console.log(dim("  nothing changes until you confirm the plan ([y]es at the prompt, or /plan confirm now)"));
+  if (cfg.autoPlan === false) console.log(dim("  (auto-planning is off; this explicit goal re-enables it)"));
+  return gen;
 }
 
 const TOOLS = [
@@ -574,8 +944,10 @@ const TOOLS = [
         "or any file change: state the goal in one sentence, then list every task with a `verify` that proves it works. " +
         "Keep it in step with reality — flip a task to in_progress when you start it and to done the moment it is " +
         "actually finished and verified. The user sees this list, and you are not allowed to stop while tasks are " +
-        "still pending. Send the COMPLETE list in `tasks` (full replace), or send just `updates` for a cheap " +
-        "status flip.",
+        "still pending. NEVER invent tasks from assumptions — check the existing code first, and never plan to " +
+        "create something that is already implemented; describe the change to the real file instead. Record what " +
+        "you verified in `findings`. Send the COMPLETE list in `tasks` (full replace), or send just `updates` for " +
+        "a cheap status flip.",
       parameters: { type: "object",
         properties: {
           goal: { type: "string", description: "One sentence: the outcome the user actually wants (not the steps)." },
@@ -588,6 +960,8 @@ const TOOLS = [
                 verify: { type: "string", description: "How to prove this task is done, e.g. 'npm test passes'." }
               },
               required: ["content", "status"] } },
+          findings: { type: "array", description: "Evidence the tasks are based on: what you checked in the existing code, what already exists, what must change (real paths/symbols). Required when you first create the list.",
+            items: { type: "string" } },
           updates: { type: "array", description: "Cheaper alternative to `tasks`: flip status on existing ids.",
             items: { type: "object",
               properties: {
@@ -667,8 +1041,8 @@ commands
   /set system <prompt>    replace system prompt
   /mode <ask|plan|code>   agent mode (ask=chat, plan=read-only plan, code=full auto)
   /plan                   show the current goal + task checklist
-  /plan goal <text>       set a goal: tasks are drafted, shown, and need
-                          your confirmation before anything runs (even with autoplan off)
+  /plan goal <text>       analyze the project, then draft evidence-based tasks
+                          (shown first — nothing runs until you confirm, even with autoplan off)
   /plan add <c> | <v>     append a task (optional verify check after |)
   /plan del|edit|verify|status <id> ...   change tasks (/plan help)
   /plan confirm           approve the plan so the next run skips the prompt
@@ -693,8 +1067,9 @@ notes
   - the agent sets a goal from your prompt, splits it into tasks, works them to done,
     and refuses to stop while tasks are still open (follow-up nudge, max ${MAX_PLAN_NUDGES}x)
     turn it off with /set autoplan off
-  - goals you set with /plan goal always get tasks immediately and pause for
-    your confirmation before the first file/command change (edit with /plan ...)
+  - goals you set with /plan goal are analyzed first (read-only scan + checks), then drafted
+    into tasks grounded in what already exists — never assuming work that is already done;
+    they pause for your confirmation before the first file/command change (edit with /plan ...)
   - env vars: AI_URL / AI_MODEL / AI_KEY / AI_DIR
 `;
 
@@ -711,6 +1086,7 @@ usage: node ai-agent.mjs [options] ["one-shot prompt"]
   --intercept         approval gate before mutating tools run
   --stream <on|off>   streaming model replies (default on); --no-stream = single JSON reply
   --autoplan <on|off>  auto-derive goal + tasks from the prompt (default: on)
+  --plan-goal <text>  analyze the project, draft tasks for this goal, then run
   --no-autoplan       same as --autoplan off
   --system <prompt>   --no-tools / --tools  --save   --list   -h`;
 
@@ -868,10 +1244,14 @@ const DANGEROUS = [
 ];
 const READONLY = [
   /^(ls|ll|dir|pwd|cd|cat|type|echo|which|where|whoami|hostname|date|stat|file|wc|head|tail|tree|findstr)\b/i,
-  /^git\s+(status|log|diff|show|branch|remote|ls-files)\b/i,
-  /^(npm|yarn|pnpm)\s+(ls|list|outdated|view|why)\b/i,
+  /^(grep|egrep|fgrep|rg|find|fd|locate|sort|uniq|cut|jq|column|nl|bat)\b/i,
+  /^(awk|sed\s+-n\b|sed\s+-e\s+[^\s;|]*p[^\s;|]*\b)/i,
+  /^git\s+(status|log|diff|show|branch|remote|ls-files|grep|blame|rev-parse|describe)\b/i,
+  /^(npm|yarn|pnpm)\s+(ls|list|outdated|view|why|test\s+--dry-run)\b/i,
   /^(node|python3?)\s+--version\b/i,
 ];
+// A command that only pipes into redirection still writes to disk — never treat it as read-only.
+const REDIRECT_WRITE = /(?:^|[^0-9])>>?(?![&>])/;
 function classifyTool(name, args) {
   if (mcpRegistry.has(name)) return "auto";
   if (name === "read_file") return "auto";
@@ -879,6 +1259,7 @@ function classifyTool(name, args) {
   if (name === "shell") {
     const c = String(args.command || args._raw || "").trim();
     if (DANGEROUS.some(re => re.test(c))) return "block";
+    if (REDIRECT_WRITE.test(c)) return "ask";
     if (READONLY.some(re => re.test(c))) return "auto";
     return "ask";
   }
@@ -906,6 +1287,7 @@ function isPlanMutating(name, args) {
   if (name === "write_file" || name === "str_replace") return true;
   if (name === "shell") {
     const c = String(args.command || args._raw || "").trim();
+    if (REDIRECT_WRITE.test(c)) return true;
     return !READONLY.some(re => re.test(c));
   }
   return false;
@@ -1925,9 +2307,8 @@ async function runTool(name, args, cfg) {
     if (PLAN) {
       PLAN.calls++;
       if (name === "shell") {
-        const cmd = String(args.command || args._raw || "");
-        noteShellRan(cmd, !!out[0]);
-        if (!READONLY.some(re => re.test(cmd.trim()))) PLAN.mutations++;
+        noteShellRan(String(args.command || args._raw || ""), !!out[0]);
+        if (isPlanMutating("shell", args)) PLAN.mutations++;
       } else if (name === "write_file" || name === "str_replace") {
         PLAN.mutations++;
       }
@@ -2741,25 +3122,7 @@ async function handleCommand(line, cfg, history, keys) {
       if (sub === "clear" || sub === "reset") { resetPlan(); console.log(dim("plan cleared")); break; }
       if (sub === "goal") {
         if (!v) { console.log(dim("usage: /plan goal <one-sentence outcome>")); break; }
-        const p = ensurePlan();
-        if (p.tasks.length && planOpen(p)) console.log(yellow(`! replacing the previous plan (${planOpen(p)} open task(s) discarded)`));
-        p.goal = clean(v, 400);
-        p.explicit = true;   // user chose this goal, so it survives autoplan=off
-        p.announced = false; // show it on the next turn
-        p.confirmed = false;
-        console.log(dim("goal set — analyzing it into tasks…"));
-        const gen = await generateTasksForGoal(cfg, p.goal);
-        applyPlanUpdate({ goal: gen.goal || p.goal, tasks: gen.tasks }, cfg);
-        p.confirmed = false;   // the fresh list always needs a review before it runs
-        p.announced = false;
-        printPlan();
-        if (gen.source === "fallback") {
-          console.log(yellow("! the planner did not return tasks — starter tasks created instead."));
-          if (gen.error) console.log(dim(`  (planner error: ${gen.error})`));
-        }
-        console.log(dim("  review with /plan · edit with /plan add|edit|del|verify|status · then send a message to start"));
-        console.log(dim("  nothing changes until you confirm the plan ([y]es at the prompt, or /plan confirm now)"));
-        if (cfg.autoPlan === false) console.log(dim("  (auto-planning is off; this explicit goal re-enables it)"));
+        await applyGoal(cfg, v);
         break;
       }
       // --- task editing (any structural change resets the confirmation) ---
@@ -2861,6 +3224,7 @@ async function handleCommand(line, cfg, history, keys) {
       }
       if (sub === "help" || (sub && !["show", "list", "view"].includes(sub))) {
         console.log(dim("usage: /plan [goal <text>|add <content>|del <id>|edit <id> <text>|verify <id> <check>|status <id> <status>|confirm|clear]"));
+        console.log(dim("  /plan goal analyzes the project (read-only) first, so tasks match what already exists"));
         if (!PLAN || !PLAN.tasks.length) break;
       }
       if (!PLAN || !PLAN.tasks.length) {
@@ -3159,6 +3523,7 @@ function parseArgs(argv) {
       case "--mode": a.mode = next(); break;
       case "--intercept": case "-i": a.intercept = true; break;
       case "--autoplan": case "--auto-plan": a.autoPlan = next(); break;
+      case "--plan-goal": case "--goal": a.planGoal = next(); break;
       case "--no-autoplan": case "--no-auto-plan": a.autoPlan = "off"; break;
       case "--no-tools": a.noTools = true; break;
       case "--tools": a.tools = true; break;
@@ -3220,6 +3585,7 @@ async function main() {
       try { applyProjectDir(cfg, true); }
       catch (e) { console.error(red("✗ " + e.message)); process.exit(1); }
       if (!cfg.context) await autoContext(cfg, null);
+      if (args.planGoal) await applyGoal(cfg, args.planGoal, { hints: false });
       const h = [{ role: "system", content: systemPrompt(cfg, text) }, { role: "user", content: text }];
       try { await agentTurn(cfg, h, {}); }
       catch (e) { console.error(red("✗ " + e.message)); process.exit(1); }
@@ -3232,6 +3598,7 @@ async function main() {
   applyProjectDir(cfg, false);
   saveCfg(cfg);
 
+  if (args.planGoal) await applyGoal(cfg, args.planGoal, { hints: false });
   if (args.prompt) {
     const h = [{ role: "system", content: systemPrompt(cfg, args.prompt) }, { role: "user", content: args.prompt }];
     try { await agentTurn(cfg, h, {}); }

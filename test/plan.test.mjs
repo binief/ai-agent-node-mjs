@@ -201,7 +201,8 @@ test("the update_plan tool schema the agent advertises is well-formed", async ()
 
     const plan = tools.find(t => t.function.name === "update_plan").function;
     assert.equal(plan.parameters.type, "object");
-    assert.deepEqual(Object.keys(plan.parameters.properties).sort(), ["goal", "tasks", "updates"]);
+    assert.deepEqual(Object.keys(plan.parameters.properties).sort(), ["findings", "goal", "tasks", "updates"]);
+    assert.equal(plan.parameters.properties.findings.items.type, "string", "findings carries the evidence");
     assert.deepEqual(plan.parameters.properties.tasks.items.properties.status.enum,
       ["pending", "in_progress", "done", "blocked", "skipped"]);
     assert.deepEqual(plan.parameters.properties.tasks.items.required, ["content", "status"]);
@@ -343,6 +344,142 @@ test("multi-step file changes with no task list are sent back to plan first", as
     assert.ok(fs.existsSync(path.join(dir, "one.txt")));
     assert.ok(fs.existsSync(path.join(dir, "two.txt")));
     assert.match(out, /plan 2\/2 done/);
+  } finally {
+    await mock.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a goal is investigated before tasks are drafted, and a task that assumes existing work is rejected", async () => {
+  const { root, home, dir } = scratch();
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(path.join(dir, "src"), { recursive: true });
+  // the form the goal is about ALREADY has a search field (the reported bug)
+  fs.writeFileSync(path.join(dir, "src", "Form.jsx"), [
+    "export function Form() {",
+    "  return (",
+    "    <form>",
+    '      <input name="search" placeholder="Search" />',
+    "    </form>",
+    "  );",
+    "}",
+  ].join("\n") + "\n");
+
+  const mock = await startMockLLM([
+    // 1. the planner investigates on its own before deciding anything
+    { toolCalls: [{ name: "read_file", arguments: { paths: ["src/Form.jsx"] } }] },
+    // 2. but the first draft still invents the reported task: "Create search field"
+    { toolCalls: [{ name: "update_plan", arguments: {
+      goal: "Add search filtering to the form",
+      tasks: [
+        { id: "t1", content: "Create search field in the form", status: "pending", verify: "input exists" },
+        { id: "t2", content: "Wire up filtering", status: "pending", verify: "node --version" },
+      ],
+    } }] },
+    // 3. the audit of that draft against the project facts rejects it
+    { content: '{"invalid":[{"id":"t1","why":"src/Form.jsx already has an input name=\\"search\\""}]}' },
+    // 4. re-plan, grounded in the file that actually exists
+    { toolCalls: [{ name: "update_plan", arguments: {
+      goal: "Make the existing search input filter as you type",
+      findings: ['src/Form.jsx already renders <input name="search">'],
+      tasks: [
+        { id: "t1", content: "Extend the existing search input in src/Form.jsx to filter as you type", status: "pending", verify: "node --version" },
+        { id: "t2", content: "Add a regression test for the filter", status: "pending", verify: "node --version" },
+      ],
+    } }] },
+    // 5. the corrected list passes the audit
+    { content: '{"invalid":[]}' },
+    // 6-8. the run itself: verify, close out, summarize
+    { toolCalls: [{ name: "shell", arguments: { command: "node --version" } }] },
+    { toolCalls: [{ name: "update_plan", arguments: { updates: [
+      { id: "t1", status: "done" }, { id: "t2", status: "done" } ] } }] },
+    { content: "Search filtering added on top of the existing input." },
+  ]);
+
+  try {
+    const { code, out } = await runAgent({
+      url: mock.url, home, dir, prompt: "go ahead",
+      extraArgs: ["--plan-goal", "Add search filtering to the search field in src/Form.jsx"],
+    });
+    assert.equal(code, 0, out);
+
+    // planning is read-only: it may inspect, never mutate
+    const names = mock.requests[0].tools.map(t => t.function.name).sort();
+    assert.deepEqual(names, ["read_file", "shell", "update_plan"]);
+    assert.ok(!names.includes("write_file"), "no mutating tools offered while planning");
+
+    // the planner is handed real facts: the inventory, the goal's own file, and the grep hits
+    const facts = mock.requests[0].messages[1].content;
+    assert.match(facts, /PROJECT FACTS/);
+    assert.match(facts, /src\/Form\.jsx/);
+    assert.match(facts, /name="search"/);
+    assert.match(facts, /already present in the code/);
+    assert.match(mock.requests[0].messages[0].content, /NEVER create a task to create\/add\/build\/implement something/);
+
+    // its own investigation result reached the planner before it wrote the tasks
+    const probe = mock.requests[1].messages.filter(m => m.role === "tool").at(-1);
+    assert.match(probe.content, /name="search"/);
+
+    // the inventoried task was rejected and re-planned against the evidence
+    assert.match(out, /the draft plan does not match the project/);
+    assert.match(out, /already has an input name="search"/);
+    assert.match(out, /revising the tasks against what the scan found/);
+    assert.doesNotMatch(out, /Create search field/i);
+
+    // the user sees the scan summary, the evidence, and the grounded tasks
+    assert.match(out, /analyzing the project before planning/);
+    assert.match(out, /\u2315 .*project files scanned/);
+    assert.match(out, /GOAL: Make the existing search input filter as you type/);
+    assert.match(out, /based on: src\/Form\.jsx already renders/);
+    assert.match(out, /\[t1\] Extend the existing search input in src\/Form\.jsx/);
+
+    // the evidence stays in front of the model during the run itself
+    assert.match(mock.requests.at(-1).messages[0].content, /based on: src\/Form\.jsx already renders/);
+  } finally {
+    await mock.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("planning is read-only: mutating probes are refused while read-only ones run", async () => {
+  const { root, home, dir } = scratch();
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "a.js"), "export const a = 1;\n");
+
+  const mock = await startMockLLM([
+    // the planner tries to DO the work instead of planning it -> must be refused
+    { toolCalls: [{ name: "shell", arguments: { command: "echo hacked > a.js" } }] },
+    // a genuine read-only probe is allowed
+    { toolCalls: [{ name: "shell", arguments: { command: "grep -n export a.js" } }] },
+    // ...then it plans
+    { toolCalls: [{ name: "update_plan", arguments: {
+      goal: "Keep a.js tidy",
+      findings: ["a.js exports a constant"],
+      tasks: [{ id: "t1", content: "tidy a.js", status: "pending", verify: "node --version" }],
+    } }] },
+    { content: '{"invalid":[]}' },
+    { toolCalls: [{ name: "shell", arguments: { command: "node --version" } }] },
+    { toolCalls: [{ name: "update_plan", arguments: { updates: [{ id: "t1", status: "done" }] } }] },
+    { content: "Done." },
+  ]);
+
+  try {
+    const { code, out } = await runAgent({
+      url: mock.url, home, dir, prompt: "tidy it", extraArgs: ["--plan-goal", "Tidy a.js"],
+    });
+    assert.equal(code, 0, out);
+
+    // the file was never touched while planning
+    assert.equal(fs.readFileSync(path.join(dir, "a.js"), "utf8"), "export const a = 1;\n");
+
+    // the refusal is explained to the planner...
+    const refused = mock.requests[1].messages.filter(m => m.role === "tool").at(-1);
+    assert.match(refused.content, /planning is READ-ONLY/);
+    assert.match(out, /refused/);
+    // ...and the read-only probe really ran
+    const probe = mock.requests[2].messages.filter(m => m.role === "tool").at(-1);
+    assert.match(probe.content, /export const a = 1/);
   } finally {
     await mock.close();
     fs.rmSync(root, { recursive: true, force: true });

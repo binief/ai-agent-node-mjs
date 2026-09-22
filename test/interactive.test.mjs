@@ -192,9 +192,14 @@ test({ name: "/plan goal drafts tasks immediately and /plan edits them", skip: !
     assert.match(plain, /GOAL: Add a health check/);
     assert.match(plain, /\[t1\] add health endpoint/);
     assert.match(plain, /\[t2\] cover it with a test/);
-    // the planner used a dedicated planning call (update_plan tool only)
+    // the planner is a dedicated call that may READ (to see what already exists) but never write
     assert.equal(mock.requests.length >= 1, true);
-    assert.deepEqual(mock.requests[0].tools.map(t => t.function.name), ["update_plan"]);
+    const plannerTools = mock.requests[0].tools.map(t => t.function.name).sort();
+    assert.deepEqual(plannerTools, ["read_file", "shell", "update_plan"]);
+    assert.ok(!plannerTools.includes("write_file") && !plannerTools.includes("str_replace"),
+      "planning must not be offered mutating tools");
+    // and it is handed real facts about the project before it drafts anything
+    assert.match(mock.requests[0].messages[1].content, /PROJECT FACTS/);
 
     // edits landed
     assert.match(plain, /added \[t3\]/);
@@ -226,6 +231,8 @@ test({ name: "explicit goals pause for confirmation before the first change", sk
         { id: "t1", content: "write hello.txt", status: "pending", verify: "hello.txt exists" },
       ],
     } }] },
+    // audit of the draft against the scanned facts: nothing to reject
+    { content: '{"invalid":[]}' },
     // first "do it": tries to write -> user rejects at the prompt
     { toolCalls: [{ name: "write_file", arguments: { path: "hello.txt", content: "hi\n" } }] },
     // second "go": tries again -> user accepts, the write runs
