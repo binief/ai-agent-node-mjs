@@ -307,3 +307,44 @@ test("a plain question needs no plan and no follow-up nudge", async () => {  con
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("multi-step file changes with no task list are sent back to plan first", async () => {
+  const { root, home, dir } = scratch();
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true });
+
+  const mock = await startMockLLM([
+    // 1. two writes with no update_plan first
+    { toolCalls: [
+      { name: "write_file", arguments: { path: "one.txt", content: "1\n" } },
+      { name: "write_file", arguments: { path: "two.txt", content: "2\n" } },
+    ] },
+    // 2. tries to stop without any tasks -> gate must demand a plan
+    { content: "Done!" },
+    // 3. creates the list after the nudge (already written, nothing left to check)
+    { toolCalls: [{ name: "update_plan", arguments: {
+      goal: "Write two text files",
+      tasks: [
+        { id: "t1", content: "write one.txt", status: "done" },
+        { id: "t2", content: "write two.txt", status: "done" },
+      ],
+    } }] },
+    // 4. final summary
+    { content: "Wrote both files." },
+  ]);
+
+  try {
+    const { code, out } = await runAgent({ url: mock.url, home, dir, prompt: "Write one.txt and two.txt." });
+    assert.equal(code, 0, out);
+    assert.match(out, /following up \(1\/2\)/);
+    const nudge = mock.requests[2].messages.at(-1);
+    assert.equal(nudge.role, "user");
+    assert.match(nudge.content, /NO PLAN YET/);
+    assert.ok(fs.existsSync(path.join(dir, "one.txt")));
+    assert.ok(fs.existsSync(path.join(dir, "two.txt")));
+    assert.match(out, /plan 2\/2 done/);
+  } finally {
+    await mock.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

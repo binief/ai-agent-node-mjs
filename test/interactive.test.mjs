@@ -142,3 +142,139 @@ test({ name: "/plan shows the live goal and checklist in the REPL", skip: !hasSc
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test({ name: "/plan goal drafts tasks immediately and /plan edits them", skip: !hasScript && "needs `script` for a pty" }, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-pty3-"));
+  const home = path.join(root, "home");
+  const dir = path.join(root, "proj");
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true });
+
+  const mock = await startMockLLM([
+    // planner call for "/plan goal ...": returns a real task list via update_plan
+    { toolCalls: [{ name: "update_plan", arguments: {
+      goal: "Add a health check",
+      tasks: [
+        { id: "t1", content: "add health endpoint", status: "pending", verify: "curl localhost:3000/health returns ok" },
+        { id: "t2", content: "cover it with a test", status: "pending", verify: "npm test passes" },
+      ],
+    } }] },
+  ]);
+
+  const cmd = `node ${AGENT} --url ${mock.url} --model mock-model --key k --dir ${dir} --context 8000`;
+  const child = spawn("script", ["-qec", cmd, "/dev/null"], {
+    env: { ...process.env, HOME: home, NO_COLOR: "1", TERM: "dumb" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let out = "";
+  child.stdout.on("data", c => (out += c));
+  child.stderr.on("data", c => (out += c));
+
+  try {
+    await sleep(1500);
+    child.stdin.write("/plan goal Add a health check\r");
+    await sleep(2500);
+    child.stdin.write("/plan add Document the endpoint | README mentions \/health\r");
+    await sleep(800);
+    child.stdin.write("/plan status t1 in_progress\r");
+    await sleep(800);
+    child.stdin.write("/plan\r");
+    await sleep(800);
+    child.stdin.write("/exit\r");
+    await sleep(1000);
+    child.kill();
+    await sleep(300);
+
+    const plain = out.replace(/\r/g, "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+
+    // tasks were drafted by the planner call the moment the goal was set
+    assert.match(plain, /goal set/);
+    assert.match(plain, /GOAL: Add a health check/);
+    assert.match(plain, /\[t1\] add health endpoint/);
+    assert.match(plain, /\[t2\] cover it with a test/);
+    // the planner used a dedicated planning call (update_plan tool only)
+    assert.equal(mock.requests.length >= 1, true);
+    assert.deepEqual(mock.requests[0].tools.map(t => t.function.name), ["update_plan"]);
+
+    // edits landed
+    assert.match(plain, /added \[t3\]/);
+    assert.match(plain, /\[t3\] Document the endpoint/);
+    assert.match(plain, /\[t1\] → in_progress/);
+
+    // the list is still there at the end, awaiting confirmation
+    const tail = plain.slice(plain.lastIndexOf("/plan"));
+    assert.match(tail, /awaiting confirmation/);
+  } finally {
+    try { child.kill("SIGKILL"); } catch {}
+    await mock.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test({ name: "explicit goals pause for confirmation before the first change", skip: !hasScript && "needs `script` for a pty" }, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-pty4-"));
+  const home = path.join(root, "home");
+  const dir = path.join(root, "proj");
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true });
+
+  const mock = await startMockLLM([
+    // planner call for "/plan goal ...": draft the list
+    { toolCalls: [{ name: "update_plan", arguments: {
+      goal: "Write hello.txt",
+      tasks: [
+        { id: "t1", content: "write hello.txt", status: "pending", verify: "hello.txt exists" },
+      ],
+    } }] },
+    // first "do it": tries to write -> user rejects at the prompt
+    { toolCalls: [{ name: "write_file", arguments: { path: "hello.txt", content: "hi\n" } }] },
+    // second "go": tries again -> user accepts, the write runs
+    { toolCalls: [{ name: "write_file", arguments: { path: "hello.txt", content: "hi\n" } }] },
+    // close out (verify cleared: nothing left to check after the write)
+    { toolCalls: [{ name: "update_plan", arguments: {
+      tasks: [{ id: "t1", content: "write hello.txt", status: "done", verify: "" }],
+    } }] },
+    { content: "Wrote hello.txt." },
+  ]);
+
+  const cmd = `node ${AGENT} --url ${mock.url} --model mock-model --key k --dir ${dir} --context 8000`;
+  const child = spawn("script", ["-qec", cmd, "/dev/null"], {
+    env: { ...process.env, HOME: home, NO_COLOR: "1", TERM: "dumb" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let out = "";
+  child.stdout.on("data", c => (out += c));
+  child.stderr.on("data", c => (out += c));
+
+  try {
+    await sleep(1500);
+    child.stdin.write("/plan goal Write hello.txt\r");
+    await sleep(2500);
+    child.stdin.write("do it\r");
+    await sleep(2500);   // let the turn reach the confirmation prompt
+    child.stdin.write("n");
+    await sleep(1500);
+    assert.ok(!fs.existsSync(path.join(dir, "hello.txt")), "rejected plan wrote nothing");
+    child.stdin.write("go\r");
+    await sleep(2500);   // reach the prompt again
+    child.stdin.write("y");
+    await sleep(3000);   // write + close-out + summary
+    child.stdin.write("/exit\r");
+    await sleep(1000);
+    child.kill();
+    await sleep(300);
+
+    const plain = out.replace(/\r/g, "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+
+    assert.match(plain, /proceed with this plan\?/);
+    assert.match(plain, /plan not confirmed/);
+    assert.match(plain, /plan confirmed — proceeding/);
+    assert.match(plain, /Wrote hello\.txt\./);
+    assert.ok(fs.existsSync(path.join(dir, "hello.txt")), "accepted plan wrote the file");
+    assert.equal(fs.readFileSync(path.join(dir, "hello.txt"), "utf8"), "hi\n");
+  } finally {
+    try { child.kill("SIGKILL"); } catch {}
+    await mock.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

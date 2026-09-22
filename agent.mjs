@@ -3,6 +3,18 @@
  * ai-agent.mjs — minimal, fully-working, self-learning terminal AI agent.
  * Node >= 18, ZERO dependencies (stdlib only).
  *
+ * v2.13.0 — v2.12.0 + goal planning with confirmation:
+ *   - `/plan goal <text>` now analyzes the goal immediately and drafts 3-12
+ *     verifiable tasks via a focused planner call (with a starter-task fallback
+ *     so a goal NEVER sits task-less again), then shows the full checklist.
+ *   - Explicit goals need one confirmation before anything mutates: the first
+ *     write/edit/shell change pauses with the plan and waits for [y]es/[n]o.
+ *     Piped/one-shot runs auto-proceed. `/plan confirm` pre-approves.
+ *   - Tasks are editable: `/plan add|del|edit|verify|status` (structural edits
+ *     reset the confirmation so the new list is reviewed before execution).
+ *   - Completion gate now also refuses multi-step file changes made with no
+ *     task list at all ("NO PLAN YET" nudge) instead of letting them slip by.
+ *
  * v2.12.0 — v2.11.0 + configurable streaming:
  *   - `/set stream <on|off>` (default on) — also `--stream on|off` / `--no-stream` and
  *     env AI_STREAM. When off, the model endpoint is called with `"stream": false` and the
@@ -66,7 +78,7 @@ import { exec, spawn } from "node:child_process";
 import process from "node:process";
 import { EventSource } from "eventsource";
 
-const VERSION = "2.12.0";
+const VERSION = "2.13.0";
 
 // ------------------------------------------------------------------ data folder
 const DATA_DIR = path.join(os.homedir(), ".aiterm");
@@ -232,6 +244,7 @@ function newPlan(goal = "") {
     dirty: false,            // checklist changed outside update_plan — needs a reprint
     explicit: false,         // user set this goal via /plan goal — survives autoplan=off
     announced: false,        // goal already shown to the user for this plan
+    confirmed: false,           // user approved this task list (explicit goals pause until they do)
     sinceUpdate: { shell: 0 },
     created: Date.now(),
   };
@@ -258,7 +271,10 @@ function seedGoal(text) {
 function startPlanTurn(goal) {
   const p = ensurePlan(goal);
   p.rounds = 0; p.calls = 0; p.mutations = 0; p.nudges = 0;
-  p.touched = false; p.armed = planTasks(p).length > 0;   // open work from earlier ⇒ stay on it
+  p.touched = false;
+  // Armed when there is open work from earlier OR the user set an explicit goal:
+  // an explicit goal must end up with tasks, even if the model never volunteers any.
+  p.armed = planTasks(p).length > 0 || p.explicit === true;
   // A goal must be visible even if the model never opens a task list. Announce once per
   // plan, whether it was derived from the prompt just now or set earlier via /plan goal.
   p.fresh = !p.announced && !!p.goal;
@@ -266,12 +282,16 @@ function startPlanTurn(goal) {
 }
 
 const clean = (s, n) => String(s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
-function normalizeStatus(s) {
-  const v = String(s ?? "pending").toLowerCase().replace(/[\s-]/g, "_");
+function parseStatus(s) {
+  const v = String(s ?? "").toLowerCase().replace(/[\s-]/g, "_");
+  if (!v) return null;
   if (v === "doing" || v === "active" || v === "working" || v === "started") return "in_progress";
   if (v === "complete" || v === "completed" || v === "finished") return "done";
   if (v === "todo" || v === "open" || v === "queued") return "pending";
-  return TASK_STATUS.includes(v) ? v : "pending";
+  return TASK_STATUS.includes(v) ? v : null;
+}
+function normalizeStatus(s) {
+  return parseStatus(s) ?? "pending";
 }
 function normalizeTask(raw, i, prev) {
   const o = raw && typeof raw === "object" ? raw : { content: String(raw ?? "") };
@@ -429,8 +449,21 @@ function planPromptBlock() {
 // or null when it is allowed to end the turn.
 function planGate() {
   const p = PLAN;
-  if (!p || !p.armed || !p.tasks.length) return null;
+  if (!p) return null;
   if (p.nudges >= MAX_PLAN_NUDGES) return null;
+  // No task list at all: explicit user-set goals and multi-step file changes must be planned.
+  // Plain questions and single trivial edits are still allowed to finish without a list.
+  if (!p.tasks.length) {
+    if (!p.explicit && !(p.mutations > 1)) return null;
+    const why = p.explicit
+      ? `the user set an explicit goal ("${p.goal || "(unset)"}") but there are no tasks yet`
+      : `you already changed files ${p.mutations}x without any task list`;
+    return "NO PLAN YET. " + why + ". " +
+      "Call update_plan NOW with the goal in one sentence and 3-12 concrete tasks " +
+      "(each with a `verify` check that proves it works), then continue the work. " +
+      "Do NOT ask the user anything — just create the list and keep going.";
+  }
+  if (!p.armed) return null;
   const open = activeTasks(p);
   const unverified = p.tasks.filter(t => t.status === "done" && t.verify && t.unverified);
   if (!open.length && !unverified.length) return null;
@@ -445,6 +478,92 @@ function planGate() {
     "\nFinish the remaining work now — do NOT restate the plan, do NOT ask the user to confirm. " +
     "Batch all independent tool calls into a single response to keep round trips low, then call " +
     "update_plan to reflect the new state. Only if a task is truly impossible, mark it blocked with a note.";
+}
+
+// ------------------------------------------------------------------ goal planner
+// Turns a user-set goal into a draft task list with ONE focused model call, so a goal
+// NEVER sits task-less waiting for the model to volunteer update_plan (the old bug:
+// tasks were only created when the model felt like calling the tool). Always returns
+// 3+ tasks — if the model call fails or returns nothing usable, deterministic starter
+// tasks are used instead so the user still gets something to review and edit.
+function starterTasksFor(goal) {
+  const g = String(goal || "the goal").replace(/\s+/g, " ").trim().slice(0, 120) || "the goal";
+  return [
+    { id: "t1", content: `Explore the relevant code for: ${g}`, status: "pending", verify: "relevant files identified" },
+    { id: "t2", content: `Implement: ${g}`, status: "pending", verify: "changes applied and app still runs" },
+    { id: "t3", content: "Verify with build/tests", status: "pending", verify: "build/tests pass" },
+  ];
+}
+
+async function generateTasksForGoal(cfg, goal) {
+  const fallback = (error) => ({ tasks: starterTasksFor(goal), goal, source: "fallback", error });
+  let listing = "";
+  try {
+    const base = cfg.projectDir || process.cwd();
+    listing = fs.readdirSync(base, { withFileTypes: true }).slice(0, 40)
+      .map(e => (e.isDirectory() ? e.name + "/" : e.name)).join(", ");
+  } catch {}
+  const plannerSys =
+    "You are a planner for an autonomous coding agent. Decompose the user's GOAL into " +
+    "3-12 concrete, ordered, individually verifiable tasks. Call the update_plan tool " +
+    "exactly once with the goal (one sentence: the outcome the user wants) and the full " +
+    "task list; every task needs id (t1, t2, ...), content (one concrete step), status " +
+    "\"pending\", and verify (the command or check that proves it works). Do not do the " +
+    "work yourself and do not call any other tool.";
+  const plannerUser =
+    `GOAL: ${goal}\n` +
+    `Project folder: ${cfg.projectDir || process.cwd()}\n` +
+    `Top-level files: ${listing || "(unknown)"}\n\n` +
+    "Reply ONLY via the update_plan tool call.";
+  const planTool = TOOLS.find(t => t.function.name === "update_plan");
+  let result = null;
+  spin.start("planning…");
+  try {
+    try {
+      for await (const ev of streamChat(cfg,
+        [{ role: "system", content: plannerSys }, { role: "user", content: plannerUser }],
+        planTool ? [planTool] : [], null)) {
+        if (ev.type === "end") result = ev.result;
+      }
+    } catch (e) {
+      // Endpoint rejects tools (plain-chat server): retry without tools and parse JSON.
+      if (planTool && /tool|function/i.test(String(e?.message || e))) {
+        result = null;
+        for await (const ev of streamChat(cfg,
+          [{ role: "system", content: plannerSys + " Reply with a single JSON object ONLY: {\"goal\": \"...\", \"tasks\": [{\"id\": \"t1\", \"content\": \"...\", \"status\": \"pending\", \"verify\": \"...\"}]}. No other text." },
+           { role: "user", content: plannerUser }],
+          [], null)) {
+          if (ev.type === "end") result = ev.result;
+        }
+      } else throw e;
+    }
+  } catch (e) {
+    spin.stop();
+    return fallback(String(e?.message || e));
+  }
+  spin.stop();
+  // 1. preferred: a real update_plan tool call
+  const tc = (result?.toolCalls || []).find(t => t.name === "update_plan");
+  if (tc) {
+    try {
+      const args = JSON.parse(tc.arguments);
+      if (Array.isArray(args.tasks) && args.tasks.length)
+        return { tasks: args.tasks, goal: String(args.goal || goal), source: "llm" };
+    } catch {}
+  }
+  // 2. plain-JSON reply (tool-less endpoint or chatty model): extract {"tasks": [...]}
+  const content = String(result?.content || "").trim();
+  const candidates = [content];
+  const greedy = content.match(/\{[\s\S]*\}/);
+  if (greedy && greedy[0] !== content) candidates.push(greedy[0]);
+  for (const c of candidates) {
+    try {
+      const obj = JSON.parse(c);
+      if (obj && Array.isArray(obj.tasks) && obj.tasks.length)
+        return { tasks: obj.tasks, goal: String(obj.goal || goal), source: "llm-json" };
+    } catch {}
+  }
+  return fallback("");
 }
 
 const TOOLS = [
@@ -548,7 +667,11 @@ commands
   /set system <prompt>    replace system prompt
   /mode <ask|plan|code>   agent mode (ask=chat, plan=read-only plan, code=full auto)
   /plan                   show the current goal + task checklist
-  /plan goal <text>       set a goal yourself (works even with autoplan off)
+  /plan goal <text>       set a goal: tasks are drafted, shown, and need
+                          your confirmation before anything runs (even with autoplan off)
+  /plan add <c> | <v>     append a task (optional verify check after |)
+  /plan del|edit|verify|status <id> ...   change tasks (/plan help)
+  /plan confirm           approve the plan so the next run skips the prompt
   /plan clear             drop the current plan
   /redact <on|off>        toggle silent secret redaction (default: on)
   /compact                summarize & shrink history (use when context is getting full)
@@ -570,6 +693,8 @@ notes
   - the agent sets a goal from your prompt, splits it into tasks, works them to done,
     and refuses to stop while tasks are still open (follow-up nudge, max ${MAX_PLAN_NUDGES}x)
     turn it off with /set autoplan off
+  - goals you set with /plan goal always get tasks immediately and pause for
+    your confirmation before the first file/command change (edit with /plan ...)
   - env vars: AI_URL / AI_MODEL / AI_KEY / AI_DIR
 `;
 
@@ -772,6 +897,48 @@ async function confirmTool(name, args, keys) {
       if (ch === "y") { process.stdout.write("\n"); return "yes"; }
       if (ch === "n" || ch === "q") { process.stdout.write("\n"); return "no"; }
       if (ch === "a") { process.stdout.write("\n"); return "always"; }
+    }
+  }
+}
+
+// A tool that changes the project (and therefore needs a confirmed plan first).
+function isPlanMutating(name, args) {
+  if (name === "write_file" || name === "str_replace") return true;
+  if (name === "shell") {
+    const c = String(args.command || args._raw || "").trim();
+    return !READONLY.some(re => re.test(c));
+  }
+  return false;
+}
+
+// One-time confirmation for explicit user-set goals: show the plan the goal was
+// expanded into and wait for approval before the first mutating tool runs.
+// Returns "yes" or "no". Non-interactive runs (piped/one-shot) auto-proceed.
+async function confirmPlan(plan, keys) {
+  if (!keys || typeof keys.key !== "function") return "yes";
+  printPlan(plan);
+  const ask = () => process.stdout.write("  " + yellow("? proceed with this plan? ") +
+    dim("[y]es  [n]o  [e]dit help: "));
+  ask();
+  for (;;) {
+    const k = await keys.key();
+    const t = k[0];
+    if (t === "ctrl_c") { process.stdout.write("\n"); return "no"; }
+    if (t === "enter")  { process.stdout.write("\n"); return "yes"; }
+    if (t === "char") {
+      const ch = k[1].toLowerCase();
+      if (ch === "y" || ch === "a") { process.stdout.write("\n"); return "yes"; }
+      if (ch === "n" || ch === "q") { process.stdout.write("\n"); return "no"; }
+      if (ch === "e") {
+        process.stdout.write("\n" + dim("  press [n], then edit with:\n") +
+          dim("    /plan add <content> | <verify>     append a task\n") +
+          dim("    /plan del <id>                     remove a task\n") +
+          dim("    /plan edit <id> <new content>      rewrite a task\n") +
+          dim("    /plan verify <id> <check>          set the verify check\n") +
+          dim("    /plan status <id> <status> [note]  flip pending|in_progress|done|blocked|skipped\n") +
+          dim("  ...then send a message to try again, or /plan confirm to pre-approve.\n"));
+        ask();
+      }
     }
   }
 }
@@ -2214,6 +2381,22 @@ async function agentTurn(cfg, history, keys) {
       let args; try { args = JSON.parse(e.function.arguments); } catch { args = { _raw: e.function.arguments }; }
       console.log(yellow("⚙ ") + bold(e.function.name) + dim(" " + fmtCall(e.function.name, args)));
 
+      // Explicit user-set goals run only after the user approved the task list.
+      // Read-only work (reads, planning) flows freely; the first mutation pauses.
+      if (plan && plan.explicit && !plan.confirmed && plan.tasks.length &&
+          isPlanMutating(e.function.name, args)) {
+        const answer = await confirmPlan(plan, keys);
+        if (answer !== "yes") {
+          history.push({ role: "tool", tool_call_id: e.id,
+            content: "error: plan not confirmed by user — do NOT run mutating tools. " +
+                     "Wait for the user to edit the plan (/plan add|edit|del|verify|status) and tell you to proceed." });
+          console.log(red("! plan not confirmed — edit with /plan add|edit|del|verify|status, then send a message to proceed (or /plan confirm to pre-approve)"));
+          return;
+        }
+        plan.confirmed = true;
+        console.log(dim("  ✓ plan confirmed — proceeding"));
+      }
+
       if (cfg.intercept) {
         const verdict = classifyTool(e.function.name, args);
         if (verdict === "block") {
@@ -2559,12 +2742,126 @@ async function handleCommand(line, cfg, history, keys) {
       if (sub === "goal") {
         if (!v) { console.log(dim("usage: /plan goal <one-sentence outcome>")); break; }
         const p = ensurePlan();
+        if (p.tasks.length && planOpen(p)) console.log(yellow(`! replacing the previous plan (${planOpen(p)} open task(s) discarded)`));
         p.goal = clean(v, 400);
         p.explicit = true;   // user chose this goal, so it survives autoplan=off
         p.announced = false; // show it on the next turn
-        console.log(dim("goal set — the model will plan against it from the next turn"));
+        p.confirmed = false;
+        console.log(dim("goal set — analyzing it into tasks…"));
+        const gen = await generateTasksForGoal(cfg, p.goal);
+        applyPlanUpdate({ goal: gen.goal || p.goal, tasks: gen.tasks }, cfg);
+        p.confirmed = false;   // the fresh list always needs a review before it runs
+        p.announced = false;
+        printPlan();
+        if (gen.source === "fallback") {
+          console.log(yellow("! the planner did not return tasks — starter tasks created instead."));
+          if (gen.error) console.log(dim(`  (planner error: ${gen.error})`));
+        }
+        console.log(dim("  review with /plan · edit with /plan add|edit|del|verify|status · then send a message to start"));
+        console.log(dim("  nothing changes until you confirm the plan ([y]es at the prompt, or /plan confirm now)"));
         if (cfg.autoPlan === false) console.log(dim("  (auto-planning is off; this explicit goal re-enables it)"));
         break;
+      }
+      // --- task editing (any structural change resets the confirmation) ---
+      const needTasks = () => {
+        if (!PLAN || !PLAN.tasks.length) { console.log(dim("no tasks to change — set one first with /plan goal <text> or /plan add <content>")); return false; }
+        return true;
+      };
+      const findTask = (id) => {
+        const s = String(id || "").trim();
+        return PLAN.tasks.find(x => x.id === s) ||
+          PLAN.tasks[Number(s.replace(/\D/g, "")) - 1] || null;
+      };
+      const unconfirm = () => { if (PLAN) PLAN.confirmed = false; };
+      if (sub === "add") {
+        if (!v) { console.log(dim("usage: /plan add <content> | <verify check>")); break; }
+        const p = ensurePlan();
+        const [content, ...rest] = v.split("|");
+        const verify = rest.join("|").trim();
+        let n = p.tasks.length + 1;
+        let id = `t${n}`;
+        while (p.tasks.some(t => t.id === id)) id = `t${++n}`;
+        const t = normalizeTask({ id, content: content.trim(), status: "pending", verify }, p.tasks.length, null);
+        if (!t.content) { console.log(dim("usage: /plan add <content> | <verify check>")); break; }
+        p.tasks.push(t);
+        p.armed = true;
+        unconfirm();
+        console.log(dim(`✓ added [${t.id}]`));
+        printPlan();
+        break;
+      }
+      if (sub === "del" || sub === "rm" || sub === "remove") {
+        if (!needTasks()) break;
+        const t = findTask(v);
+        if (!t) { console.log(dim(`usage: /plan del <id>   (ids: ${PLAN.tasks.map(x => x.id).join(", ")})`)); break; }
+        PLAN.tasks = PLAN.tasks.filter(x => x !== t);
+        unconfirm();
+        console.log(dim(`✓ removed [${t.id}] ${t.content}`));
+        printPlan();
+        break;
+      }
+      if (sub === "edit") {
+        if (!needTasks()) break;
+        const id = (v.split(/\s+/)[0] || "");
+        const content = v.slice(id.length).trim();
+        const t = findTask(id);
+        if (!t || !content) { console.log(dim("usage: /plan edit <id> <new content>")); break; }
+        t.content = clean(content, 200);
+        unconfirm();
+        console.log(dim(`✓ edited [${t.id}]`));
+        printPlan();
+        break;
+      }
+      if (sub === "verify" || sub === "check") {
+        if (!needTasks()) break;
+        const id = (v.split(/\s+/)[0] || "");
+        const check = v.slice(id.length).trim();
+        const t = findTask(id);
+        if (!t || !check) { console.log(dim("usage: /plan verify <id> <check that proves it works>")); break; }
+        t.verify = clean(check, 160);
+        if (t.status === "done") t.unverified = true;
+        unconfirm();
+        console.log(dim(`✓ verify set for [${t.id}]`));
+        printPlan();
+        break;
+      }
+      if (sub === "status" || sub === "state") {
+        if (!needTasks()) break;
+        const id = (v.split(/\s+/)[0] || "");
+        const t = findTask(id);
+        const words = v.slice(id.length).trim().split(/\s+/).filter(Boolean);
+        let status = null, note = "";
+        // "in progress" arrives as two words — try it before the single-word form
+        if (words.length >= 2 && parseStatus(words[0] + " " + words[1])) {
+          status = parseStatus(words[0] + " " + words[1]);
+          note = words.slice(2).join(" ");
+        } else {
+          status = parseStatus(words[0]);
+          note = words.slice(1).join(" ");
+        }
+        if (!t || !status) {
+          console.log(dim("usage: /plan status <id> <pending|in_progress|done|blocked|skipped> [note]"));
+          break;
+        }
+        if ((status === "blocked" || status === "skipped") && !note)
+          console.log(yellow(`! ${status} without a reason — consider adding a note`));
+        t.status = status;
+        if (note) t.note = clean(note, 200);
+        t.unverified = false;   // the user set the state themselves — trusted
+        console.log(dim(`✓ [${t.id}] → ${status}`));
+        printPlan();
+        break;
+      }
+      if (sub === "confirm" || sub === "ok" || sub === "approve") {
+        if (!needTasks()) break;
+        PLAN.confirmed = true;
+        console.log(dim("✓ plan confirmed — the next run will proceed without asking"));
+        printPlan();
+        break;
+      }
+      if (sub === "help" || (sub && !["show", "list", "view"].includes(sub))) {
+        console.log(dim("usage: /plan [goal <text>|add <content>|del <id>|edit <id> <text>|verify <id> <check>|status <id> <status>|confirm|clear]"));
+        if (!PLAN || !PLAN.tasks.length) break;
       }
       if (!PLAN || !PLAN.tasks.length) {
         if (PLAN?.goal) console.log(dim("no tasks yet — goal: " + PLAN.goal));
@@ -2576,7 +2873,9 @@ async function handleCommand(line, cfg, history, keys) {
       console.log(renderPlan(PLAN, "  "));
       const done = PLAN.tasks.filter(t => t.status === "done").length;
       const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
-      console.log(dim(`  ${done}/${PLAN.tasks.length} done · ${plural(PLAN.rounds, "round trip")} · ${plural(PLAN.calls, "tool call")}`));
+      let stats = `  ${done}/${PLAN.tasks.length} done · ${plural(PLAN.rounds, "round trip")} · ${plural(PLAN.calls, "tool call")}`;
+      if (PLAN.explicit) stats += PLAN.confirmed ? " · confirmed" : " · awaiting confirmation";
+      console.log(dim(stats));
       break;
     }
     case "/cd":
