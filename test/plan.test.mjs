@@ -201,8 +201,7 @@ test("the update_plan tool schema the agent advertises is well-formed", async ()
 
     const plan = tools.find(t => t.function.name === "update_plan").function;
     assert.equal(plan.parameters.type, "object");
-    assert.deepEqual(Object.keys(plan.parameters.properties).sort(), ["findings", "goal", "tasks", "updates"]);
-    assert.equal(plan.parameters.properties.findings.items.type, "string", "findings carries the evidence");
+    assert.deepEqual(Object.keys(plan.parameters.properties).sort(), ["goal", "tasks", "updates"]);
     assert.deepEqual(plan.parameters.properties.tasks.items.properties.status.enum,
       ["pending", "in_progress", "done", "blocked", "skipped"]);
     assert.deepEqual(plan.parameters.properties.tasks.items.required, ["content", "status"]);
@@ -309,47 +308,6 @@ test("a plain question needs no plan and no follow-up nudge", async () => {  con
   }
 });
 
-test("multi-step file changes with no task list are sent back to plan first", async () => {
-  const { root, home, dir } = scratch();
-  fs.mkdirSync(home, { recursive: true });
-  fs.mkdirSync(dir, { recursive: true });
-
-  const mock = await startMockLLM([
-    // 1. two writes with no update_plan first
-    { toolCalls: [
-      { name: "write_file", arguments: { path: "one.txt", content: "1\n" } },
-      { name: "write_file", arguments: { path: "two.txt", content: "2\n" } },
-    ] },
-    // 2. tries to stop without any tasks -> gate must demand a plan
-    { content: "Done!" },
-    // 3. creates the list after the nudge (already written, nothing left to check)
-    { toolCalls: [{ name: "update_plan", arguments: {
-      goal: "Write two text files",
-      tasks: [
-        { id: "t1", content: "write one.txt", status: "done" },
-        { id: "t2", content: "write two.txt", status: "done" },
-      ],
-    } }] },
-    // 4. final summary
-    { content: "Wrote both files." },
-  ]);
-
-  try {
-    const { code, out } = await runAgent({ url: mock.url, home, dir, prompt: "Write one.txt and two.txt." });
-    assert.equal(code, 0, out);
-    assert.match(out, /following up \(1\/2\)/);
-    const nudge = mock.requests[2].messages.at(-1);
-    assert.equal(nudge.role, "user");
-    assert.match(nudge.content, /NO PLAN YET/);
-    assert.ok(fs.existsSync(path.join(dir, "one.txt")));
-    assert.ok(fs.existsSync(path.join(dir, "two.txt")));
-    assert.match(out, /plan 2\/2 done/);
-  } finally {
-    await mock.close();
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
 test("a goal is investigated before tasks are drafted, and a task that assumes existing work is rejected", async () => {
   const { root, home, dir } = scratch();
   fs.mkdirSync(home, { recursive: true });
@@ -429,12 +387,17 @@ test("a goal is investigated before tasks are drafted, and a task that assumes e
     // the user sees the scan summary, the evidence, and the grounded tasks
     assert.match(out, /analyzing the project before planning/);
     assert.match(out, /\u2315 .*project files scanned/);
-    assert.match(out, /GOAL: Make the existing search input filter as you type/);
-    assert.match(out, /based on: src\/Form\.jsx already renders/);
+    // the user's own words stay the goal; the planner's restatement is shown next to it
+    assert.match(out, /GOAL: Add search filtering to the search field in src\/Form\.jsx/);
+    assert.match(out, /reading: Make the existing search input filter as you type/);
+    assert.match(out, /evidence: src\/Form\.jsx already renders <input name="search">/);
     assert.match(out, /\[t1\] Extend the existing search input in src\/Form\.jsx/);
 
-    // the evidence stays in front of the model during the run itself
-    assert.match(mock.requests.at(-1).messages[0].content, /based on: src\/Form\.jsx already renders/);
+    // the goal the user typed is what the model is given during the run — never a rewritten one
+    assert.match(mock.requests.at(-1).messages[0].content, /GOAL: Add search filtering to the search field in src\/Form\.jsx/);
+    assert.doesNotMatch(mock.requests.at(-1).messages[0].content, /GOAL: Make the existing search input filter/);
+    // and the planner's evidence never leaks into the model's system prompt as fact
+    assert.doesNotMatch(mock.requests.at(-1).messages[0].content, /based on: src\/Form\.jsx already renders/);
   } finally {
     await mock.close();
     fs.rmSync(root, { recursive: true, force: true });
@@ -480,6 +443,38 @@ test("planning is read-only: mutating probes are refused while read-only ones ru
     // ...and the read-only probe really ran
     const probe = mock.requests[2].messages.filter(m => m.role === "tool").at(-1);
     assert.match(probe.content, /export const a = 1/);
+  } finally {
+    await mock.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a normal prompt keeps v2.12.0 behavior: no forced plan, no surprise nudge", async () => {
+  const { root, home, dir } = scratch();
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true });
+
+  // two file changes in one response, and no update_plan anywhere — v2.12.0 let this finish
+  const mock = await startMockLLM([
+    { toolCalls: [
+      { name: "write_file", arguments: { path: "one.txt", content: "1\n" } },
+      { name: "write_file", arguments: { path: "two.txt", content: "2\n" } },
+    ] },
+    { content: "Wrote both files." },
+  ]);
+
+  try {
+    const { code, out } = await runAgent({ url: mock.url, home, dir, prompt: "Write one.txt and two.txt." });
+    assert.equal(code, 0, out);
+    assert.ok(fs.existsSync(path.join(dir, "one.txt")));
+    assert.ok(fs.existsSync(path.join(dir, "two.txt")));
+    // no "NO PLAN YET" push-back, no follow-up round trip: the turn ends when the model says it is done
+    assert.doesNotMatch(out, /NO PLAN YET/);
+    assert.doesNotMatch(out, /following up/);
+    assert.doesNotMatch(out, /NOT DONE YET/);
+    assert.equal(mock.used(), 2, "exactly one tool round + one final reply");
+    // and the model was never told to plan (the advertised tool stays, the push does not)
+    assert.match(mock.requests[0].messages[0].content, /PLAN AS TASKS/);
   } finally {
     await mock.close();
     fs.rmSync(root, { recursive: true, force: true });

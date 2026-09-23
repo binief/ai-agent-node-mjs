@@ -3,33 +3,17 @@
  * ai-agent.mjs — minimal, fully-working, self-learning terminal AI agent.
  * Node >= 18, ZERO dependencies (stdlib only).
  *
- * v2.14.0 — v2.13.0 + evidence-based planning (no more assumed tasks):
- *   - A goal is now ANALYZED before tasks exist: the planner gets a real scan of the project
- *     (file inventory, project manifests, grep hits for the goal's own key terms, and the content
- *     of any file the goal names) instead of a bare folder listing.
- *   - The planner may run its own READ-ONLY checks (read_file, shell with ls/cat/grep/find/rg/git)
- *     for a few rounds before it must produce the plan; writing anything while planning is refused.
- *     Read-only commands (grep/find/sed -n/…) no longer trip the plan-confirmation gate.
- *   - It is told never to plan work that already exists: if the goal names something already
- *     implemented (e.g. a search field in a form that has one), the tasks must describe the CHANGE
- *     to that real file/symbol. It must record what it relied on in `findings`, which are shown
- *     under the checklist and in the model's system prompt.
- *   - After drafting, the tasks are AUDITED against the same facts; a list that assumes existing
- *     (or non-existent) work is re-planned once, and anything still doubtful is flagged to the user.
- *   - `--plan-goal <text>` runs the same analysis non-interactively (tasks drafted, then the run
- *     starts after the plan is shown).
- *
- * v2.13.0 — v2.12.0 + goal planning with confirmation:
- *   - `/plan goal <text>` now analyzes the goal immediately and drafts 3-12
- *     verifiable tasks via a focused planner call (with a starter-task fallback
- *     so a goal NEVER sits task-less again), then shows the full checklist.
- *   - Explicit goals need one confirmation before anything mutates: the first
- *     write/edit/shell change pauses with the plan and waits for [y]es/[n]o.
- *     Piped/one-shot runs auto-proceed. `/plan confirm` pre-approves.
- *   - Tasks are editable: `/plan add|del|edit|verify|status` (structural edits
- *     reset the confirmation so the new list is reviewed before execution).
- *   - Completion gate now also refuses multi-step file changes made with no
- *     task list at all ("NO PLAN YET" nudge) instead of letting them slip by.
+ * v2.12.1 — v2.12.0 + opt-in goal planning, with NO behavior change to anything else:
+ *   - base-level compatibility is the point of this release: the system prompt, the completion
+ *     gate, the tool schema, the read-only/approval classification and the plan prompt block are
+ *     all byte-identical to v2.12.0, so every existing flow behaves exactly as before.
+ *   - ADDED (opt-in, only reachable through the explicit commands below): `/plan goal <text>`
+ *     analyzes the project read-only, drafts tasks grounded in what already exists, shows them and
+ *     waits for your confirmation (editable with /plan add|del|edit|verify|status|confirm); the
+ *     planner may inspect with read-only tools and audits its own draft against the scan; the goal
+ *     you typed is kept verbatim. `--plan-goal <text>` does the same non-interactively.
+ *   - Nothing here changes what happens for a normal prompt: no goal is drafted, no confirmation is
+ *     asked, no extra nudge is sent unless you set a goal yourself.
  *
  * v2.12.0 — v2.11.0 + configurable streaming:
  *   - `/set stream <on|off>` (default on) — also `--stream on|off` / `--no-stream` and
@@ -94,7 +78,7 @@ import { exec, spawn } from "node:child_process";
 import process from "node:process";
 import { EventSource } from "eventsource";
 
-const VERSION = "2.14.0";
+const VERSION = "2.12.1";
 
 // ------------------------------------------------------------------ data folder
 const DATA_DIR = path.join(os.homedir(), ".aiterm");
@@ -155,7 +139,7 @@ const SYS_PROMPT =
   "\n" +
   "WORK METHOD — goal, then tasks, then execution, then proof:\n" +
   "1. SET THE GOAL: restate the user's prompt as one sentence describing the OUTCOME they want (not the steps). That sentence goes into `update_plan`.\n" +
-  "2. INVESTIGATE, THEN PLAN: before writing any task, find out what ALREADY EXISTS — read the files the request names and search the code for its key terms (read_file with `paths`, shell with grep/find/rg). Never assume: a task that creates/adds something that is already implemented is a bug. Then call `update_plan` with the goal (one sentence), `findings` (the real files/facts you relied on) and 3-12 concrete, individually verifiable tasks that name the real files/symbols you found — each with a `verify` (the command or check that proves it works). Skip the plan only for a pure question or a single trivial edit.\n" +
+  "2. PLAN AS TASKS: for any request needing >1 step or any file change, call `update_plan` FIRST with the goal and 3-12 concrete, individually verifiable tasks. Give each task a `verify` — the command or check that proves it works. Skip the plan only for a pure question or a single trivial edit.\n" +
   "3. UNDERSTAND FIRST: infer the project type (language, framework, libraries) from the task and files. Explore before changing. Never assume — gather context, then act.\n" +
   "4. WORK ONE TASK AT A TIME: mark it in_progress, do it, verify it, mark it done, then move to the next. Update the plan as you go so the list always matches reality.\n" +
   "5. MINIMISE ROUND TRIPS: issue every independent tool call in ONE response — read all the files you need together (or pass `paths` to read_file), run exploration commands chained with && , and never make a call whose result you could have obtained in the same batch. Do not re-read a file you just wrote, and do not re-run a command that already succeeded.\n" +
@@ -259,7 +243,8 @@ function newPlan(goal = "") {
     touched: false,          // model called update_plan during this turn
     dirty: false,            // checklist changed outside update_plan — needs a reprint
     explicit: false,         // user set this goal via /plan goal — survives autoplan=off
-    findings: [],            // evidence the tasks are based on (what already exists / must change)
+    evidence: [],            // what the planner actually saw (shown to the user, never assumed)
+    reading: "",             // the planner's restatement of the goal, for display only
     announced: false,        // goal already shown to the user for this plan
     confirmed: false,           // user approved this task list (explicit goals pause until they do)
     sinceUpdate: { shell: 0 },
@@ -288,10 +273,7 @@ function seedGoal(text) {
 function startPlanTurn(goal) {
   const p = ensurePlan(goal);
   p.rounds = 0; p.calls = 0; p.mutations = 0; p.nudges = 0;
-  p.touched = false;
-  // Armed when there is open work from earlier OR the user set an explicit goal:
-  // an explicit goal must end up with tasks, even if the model never volunteers any.
-  p.armed = planTasks(p).length > 0 || p.explicit === true;
+  p.touched = false; p.armed = planTasks(p).length > 0;   // open work from earlier ⇒ stay on it
   // A goal must be visible even if the model never opens a task list. Announce once per
   // plan, whether it was derived from the prompt just now or set earlier via /plan goal.
   p.fresh = !p.announced && !!p.goal;
@@ -307,8 +289,13 @@ function parseStatus(s) {
   if (v === "todo" || v === "open" || v === "queued") return "pending";
   return TASK_STATUS.includes(v) ? v : null;
 }
+// Model-facing status normalisation is exactly v2.12.0: unknown states become "pending".
 function normalizeStatus(s) {
-  return parseStatus(s) ?? "pending";
+  const v = String(s ?? "pending").toLowerCase().replace(/[\s-]/g, "_");
+  if (v === "doing" || v === "active" || v === "working" || v === "started") return "in_progress";
+  if (v === "complete" || v === "completed" || v === "finished") return "done";
+  if (v === "todo" || v === "open" || v === "queued") return "pending";
+  return TASK_STATUS.includes(v) ? v : "pending";
 }
 function normalizeTask(raw, i, prev) {
   const o = raw && typeof raw === "object" ? raw : { content: String(raw ?? "") };
@@ -393,9 +380,6 @@ function applyPlanUpdate(a, cfg) {
     if (u.verify) t.verify = clean(u.verify, 160);
   }
 
-  if (Array.isArray(a?.findings))
-    p.findings = a.findings.map(f => clean(typeof f === "string" ? f : (f?.fact ?? f?.evidence ?? f?.note ?? f?.content), 200))
-      .filter(Boolean).slice(0, 6);
   if (String(a?.goal || "").trim()) p.goal = clean(a.goal, 400);
   const done = p.tasks.filter(t => t.status === "done").length;
   const open = activeTasks(p).length;
@@ -414,7 +398,6 @@ function renderPlan(p = PLAN, prefix = "  ") {
   if (!p.tasks.length) return p.goal ? `${prefix}GOAL: ${p.goal}   [no tasks yet]` : "";
   const done = p.tasks.filter(t => t.status === "done").length;
   const lines = [`${prefix}GOAL: ${p.goal || "(unset)"}   [${done}/${p.tasks.length} done]`];
-  for (const f of (p.findings || []).slice(0, 4)) lines.push(`${prefix} based on: ${f}`);
   for (const t of p.tasks) {
     let l = `${prefix} ${PLAN_ICON[t.status] || "?"} [${t.id}] ${t.content}`;
     if (t.status === "done" && t.verify) l += t.unverified ? `  (verify PENDING: ${t.verify})` : `  (verified: ${t.verify})`;
@@ -470,22 +453,8 @@ function planPromptBlock() {
 // or null when it is allowed to end the turn.
 function planGate() {
   const p = PLAN;
-  if (!p) return null;
+  if (!p || !p.armed || !p.tasks.length) return null;
   if (p.nudges >= MAX_PLAN_NUDGES) return null;
-  // No task list at all: explicit user-set goals and multi-step file changes must be planned.
-  // Plain questions and single trivial edits are still allowed to finish without a list.
-  if (!p.tasks.length) {
-    if (!p.explicit && !(p.mutations > 1)) return null;
-    const why = p.explicit
-      ? `the user set an explicit goal ("${p.goal || "(unset)"}") but there are no tasks yet`
-      : `you already changed files ${p.mutations}x without any task list`;
-    return "NO PLAN YET. " + why + ". " +
-      "Call update_plan NOW with the goal in one sentence, the `findings` you actually verified " +
-      "about the existing code, and 3-12 concrete tasks (each with a `verify` check that proves it " +
-      "works) that name the real files — never plan work that already exists. " +
-      "Do NOT ask the user anything — just create the list and keep going.";
-  }
-  if (!p.armed) return null;
   const open = activeTasks(p);
   const unverified = p.tasks.filter(t => t.status === "done" && t.verify && t.unverified);
   if (!open.length && !unverified.length) return null;
@@ -714,6 +683,18 @@ function plannerFindings(args) {
     .filter(Boolean).slice(0, 6);
 }
 
+// The planner asks for `findings` on its own private copy of the tool, so the schema advertised to
+// the main agent stays byte-identical to v2.12.0.
+function plannerPlanTool() {
+  const t = TOOLS.find(x => x.function.name === "update_plan");
+  if (!t) return null;
+  const copy = JSON.parse(JSON.stringify(t));
+  copy.function.parameters.properties.findings = { type: "array",
+    description: "Evidence for the tasks: what you checked in the existing code, what already exists, what must change (real paths/symbols).",
+    items: { type: "string" } };
+  return copy;
+}
+
 function parsePlannerCall(tc, goal) {
   const args = tryParse(tc.arguments);
   if (!args || !Array.isArray(args.tasks) || !args.tasks.length) return null;
@@ -735,6 +716,30 @@ function extractJsonObject(text) {
 }
 
 // Planning-time tool executor: read-only, capped, secret-masked, and never counted as agent work.
+// Planning is READ-ONLY, so the planner gets its own default-deny shell policy instead of the
+// agent's shared v2.12.0 classifier (which leaves `echo`/`cat` free and would let `echo x > f`
+// through). Only inspection commands pass; anything that can write is refused. Planner-only code —
+// the agent's own approval gate and mutation counting keep v2.12.0 semantics.
+const PLANNER_WRITES = /(?:^|[^0-9>])>>?(?![&>])/;
+const PLANNER_SHELL_OK = /^(ls|ll|dir|pwd|cd|cat|type|echo|which|where|whoami|hostname|date|stat|file|wc|head|tail|tree|findstr|nl|column|bat|grep|egrep|fgrep|rg|fd|awk|jq|uniq|cut|tr|comm|cmp|diff|du|df|env|printenv|uname|uptime|id|groups)\b/i;
+const PLANNER_GIT_OK = /^git\s+(status|log|diff|show|branch|remote|ls-files|grep|blame|rev-parse|describe|shortlog|tag|cat-file|show-ref|config\s+--get|stash\s+list|worktree\s+list)\b/i;
+const PLANNER_PKG_OK = /^(npm|yarn|pnpm)\s+(ls|list|outdated|view|why|info)\b/i;
+const PLANNER_VER_OK = /^(node|python3?|go|cargo|java|ruby|php)\s+(--version|-v|version)\b/i;
+function plannerShellAllowed(cmd) {
+  const c = String(cmd || "").trim();
+  if (!c) return false;
+  // every segment of every pipeline has to be an inspection command
+  for (const seg of c.split(/\s*(?:&&|\|\||;|\|)\s*/)) {
+    const t = seg.trim();
+    if (!t) continue;
+    if (PLANNER_WRITES.test(t)) return false;                                  // redirection writes
+    if (/^(sed|awk|perl|ruby|sort)\b/i.test(t) && /\s-(i|o)\b/.test(t)) return false;  // -i / -o write
+    if (/^find\b/i.test(t) && /-(delete|exec|execdir|ok|fprint)/i.test(t)) return false;
+    if (!(PLANNER_SHELL_OK.test(t) || PLANNER_GIT_OK.test(t) || PLANNER_PKG_OK.test(t) ||
+          PLANNER_VER_OK.test(t) || /^sed\s+(-n|--quiet)\b/i.test(t) || /^sort\b/i.test(t))) return false;
+  }
+  return true;
+}
 async function runPlannerTool(name, args, cfg) {
   try {
     if (name === "read_file") {
@@ -743,7 +748,7 @@ async function runPlannerTool(name, args, cfg) {
     }
     const cmd = String(args.command || args._raw || "").trim();
     if (!cmd) return [false, "error: shell needs a `command`"];
-    if (isPlanMutating("shell", args))
+    if (!plannerShellAllowed(cmd))
       return [false, "error: planning is READ-ONLY — you cannot modify files or run changing commands " +
                      "while planning. Describe the change as a task instead."];
     const [ok, text] = await runShell(cmd, Math.min(60, cfg.timeout || 60), { cwd: cfg.projectDir }, cfg);
@@ -787,7 +792,7 @@ async function plannerToolLoop(cfg, goal, rec, messages, tools, planTool) {
 // Single request that accepts EITHER an update_plan call or a plain JSON plan — used for endpoints
 // that reject tools, for the final attempt, and for the re-plan after an audit.
 async function oneShotPlan(cfg, goal, rec, note = "") {
-  const planTool = TOOLS.find(t => t.function.name === "update_plan");
+  const planTool = plannerPlanTool();
   const sys = plannerSystem() + "\nReply with ONE JSON object only, no prose and no markdown: " +
     "{\"goal\":\"...\",\"findings\":[\"fact\",...],\"tasks\":[{\"id\":\"t1\",\"content\":\"...\"," +
     "\"status\":\"pending\",\"verify\":\"...\"}]} — or call `update_plan` with the same fields.";
@@ -856,7 +861,7 @@ function starterTasksFor(goal) {
 async function generateTasksForGoal(cfg, goal) {
   const rec = buildRecon(cfg, goal);
   const fallback = (error) => ({ tasks: starterTasksFor(goal), goal, findings: [], source: "fallback", error, recon: rec });
-  const planTool = TOOLS.find(t => t.function.name === "update_plan");
+  const planTool = plannerPlanTool();
   const readTools = TOOLS.filter(t => t.function.name === "read_file" || t.function.name === "shell");
   const tools = planTool ? [...readTools, planTool] : [...readTools];
   const messages = [
@@ -910,7 +915,10 @@ async function applyGoal(cfg, goal, opts = {}) {
   p.confirmed = false;
   console.log(dim("goal set — analyzing the project before planning…"));
   const gen = await generateTasksForGoal(cfg, p.goal);
-  applyPlanUpdate({ goal: gen.goal || p.goal, tasks: gen.tasks, findings: gen.findings || [] }, cfg);
+  // The goal the user typed is the goal: the planner's restatement is shown, never substituted.
+  applyPlanUpdate({ goal: p.goal, tasks: gen.tasks }, cfg);
+  p.evidence = gen.findings || [];
+  p.reading = gen.goal && gen.goal !== p.goal ? gen.goal : "";
   p.confirmed = false;   // a fresh list always needs a review before it runs
   p.announced = false;
   const rec = gen.recon || {};
@@ -921,6 +929,8 @@ async function applyGoal(cfg, goal, opts = {}) {
   if (found.length) bits.push(`existing: ${found.map(k => `${k}×${rec.counts.get(k)}`).join(", ")}`);
   if (bits.length) console.log(dim("  ⌕ " + bits.join(" · ")));
   printPlan();
+  if (p.reading) console.log(dim(`  reading: ${p.reading}`));
+  for (const f of (p.evidence || []).slice(0, 6)) console.log(dim(`  evidence: ${f}`));
   if (gen.source === "fallback") {
     console.log(yellow("! the planner did not return tasks — starter tasks created instead."));
     if (gen.error) console.log(dim(`  (planner error: ${gen.error})`));
@@ -944,10 +954,8 @@ const TOOLS = [
         "or any file change: state the goal in one sentence, then list every task with a `verify` that proves it works. " +
         "Keep it in step with reality — flip a task to in_progress when you start it and to done the moment it is " +
         "actually finished and verified. The user sees this list, and you are not allowed to stop while tasks are " +
-        "still pending. NEVER invent tasks from assumptions — check the existing code first, and never plan to " +
-        "create something that is already implemented; describe the change to the real file instead. Record what " +
-        "you verified in `findings`. Send the COMPLETE list in `tasks` (full replace), or send just `updates` for " +
-        "a cheap status flip.",
+        "still pending. Send the COMPLETE list in `tasks` (full replace), or send just `updates` for a cheap " +
+        "status flip.",
       parameters: { type: "object",
         properties: {
           goal: { type: "string", description: "One sentence: the outcome the user actually wants (not the steps)." },
@@ -960,8 +968,6 @@ const TOOLS = [
                 verify: { type: "string", description: "How to prove this task is done, e.g. 'npm test passes'." }
               },
               required: ["content", "status"] } },
-          findings: { type: "array", description: "Evidence the tasks are based on: what you checked in the existing code, what already exists, what must change (real paths/symbols). Required when you first create the list.",
-            items: { type: "string" } },
           updates: { type: "array", description: "Cheaper alternative to `tasks`: flip status on existing ids.",
             items: { type: "object",
               properties: {
@@ -1041,8 +1047,8 @@ commands
   /set system <prompt>    replace system prompt
   /mode <ask|plan|code>   agent mode (ask=chat, plan=read-only plan, code=full auto)
   /plan                   show the current goal + task checklist
-  /plan goal <text>       analyze the project, then draft evidence-based tasks
-                          (shown first — nothing runs until you confirm, even with autoplan off)
+  /plan goal <text>       analyze the project, draft tasks from what is really
+                          there, then wait for your confirmation (works with autoplan off)
   /plan add <c> | <v>     append a task (optional verify check after |)
   /plan del|edit|verify|status <id> ...   change tasks (/plan help)
   /plan confirm           approve the plan so the next run skips the prompt
@@ -1067,9 +1073,9 @@ notes
   - the agent sets a goal from your prompt, splits it into tasks, works them to done,
     and refuses to stop while tasks are still open (follow-up nudge, max ${MAX_PLAN_NUDGES}x)
     turn it off with /set autoplan off
-  - goals you set with /plan goal are analyzed first (read-only scan + checks), then drafted
-    into tasks grounded in what already exists — never assuming work that is already done;
-    they pause for your confirmation before the first file/command change (edit with /plan ...)
+  - everything else is unchanged from v2.12.0: a normal prompt does not get a goal, a task list,
+    a confirmation prompt or an extra nudge — /plan goal is the only way in, and it pauses for
+    your confirmation before the first file/command change (edit with /plan ...)
   - env vars: AI_URL / AI_MODEL / AI_KEY / AI_DIR
 `;
 
@@ -1244,14 +1250,10 @@ const DANGEROUS = [
 ];
 const READONLY = [
   /^(ls|ll|dir|pwd|cd|cat|type|echo|which|where|whoami|hostname|date|stat|file|wc|head|tail|tree|findstr)\b/i,
-  /^(grep|egrep|fgrep|rg|find|fd|locate|sort|uniq|cut|jq|column|nl|bat)\b/i,
-  /^(awk|sed\s+-n\b|sed\s+-e\s+[^\s;|]*p[^\s;|]*\b)/i,
-  /^git\s+(status|log|diff|show|branch|remote|ls-files|grep|blame|rev-parse|describe)\b/i,
-  /^(npm|yarn|pnpm)\s+(ls|list|outdated|view|why|test\s+--dry-run)\b/i,
+  /^git\s+(status|log|diff|show|branch|remote|ls-files)\b/i,
+  /^(npm|yarn|pnpm)\s+(ls|list|outdated|view|why)\b/i,
   /^(node|python3?)\s+--version\b/i,
 ];
-// A command that only pipes into redirection still writes to disk — never treat it as read-only.
-const REDIRECT_WRITE = /(?:^|[^0-9])>>?(?![&>])/;
 function classifyTool(name, args) {
   if (mcpRegistry.has(name)) return "auto";
   if (name === "read_file") return "auto";
@@ -1259,7 +1261,6 @@ function classifyTool(name, args) {
   if (name === "shell") {
     const c = String(args.command || args._raw || "").trim();
     if (DANGEROUS.some(re => re.test(c))) return "block";
-    if (REDIRECT_WRITE.test(c)) return "ask";
     if (READONLY.some(re => re.test(c))) return "auto";
     return "ask";
   }
@@ -1283,11 +1284,11 @@ async function confirmTool(name, args, keys) {
 }
 
 // A tool that changes the project (and therefore needs a confirmed plan first).
+// Only the new explicit-goal confirmation uses this; the approval gate is untouched by v2.12.1.
 function isPlanMutating(name, args) {
   if (name === "write_file" || name === "str_replace") return true;
   if (name === "shell") {
     const c = String(args.command || args._raw || "").trim();
-    if (REDIRECT_WRITE.test(c)) return true;
     return !READONLY.some(re => re.test(c));
   }
   return false;
@@ -2307,8 +2308,9 @@ async function runTool(name, args, cfg) {
     if (PLAN) {
       PLAN.calls++;
       if (name === "shell") {
-        noteShellRan(String(args.command || args._raw || ""), !!out[0]);
-        if (isPlanMutating("shell", args)) PLAN.mutations++;
+        const cmd = String(args.command || args._raw || "");
+        noteShellRan(cmd, !!out[0]);
+        if (!READONLY.some(re => re.test(cmd.trim()))) PLAN.mutations++;
       } else if (name === "write_file" || name === "str_replace") {
         PLAN.mutations++;
       }
@@ -3235,6 +3237,8 @@ async function handleCommand(line, cfg, history, keys) {
         break;
       }
       console.log(renderPlan(PLAN, "  "));
+      if (PLAN.reading) console.log(dim(`  reading: ${PLAN.reading}`));
+      for (const f of (PLAN.evidence || []).slice(0, 6)) console.log(dim(`  evidence: ${f}`));
       const done = PLAN.tasks.filter(t => t.status === "done").length;
       const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
       let stats = `  ${done}/${PLAN.tasks.length} done · ${plural(PLAN.rounds, "round trip")} · ${plural(PLAN.calls, "tool call")}`;
