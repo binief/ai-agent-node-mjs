@@ -3,6 +3,18 @@
  * ai-agent.mjs — minimal, fully-working, self-learning terminal AI agent.
  * Node >= 18, ZERO dependencies (stdlib only).
  *
+ * v2.12.2 — v2.12.1 + a plan can no longer hijack an unrelated request:
+ *   - The plan block is injected into the system prompt on every call, and for open tasks it said
+ *     "Keep going on [t1] without asking the user anything". An unfinished plan from an earlier
+ *     request therefore outranked the request the user had just typed — which is how "set the
+ *     button height and width" turned into writing project documentation.
+ *   - Now an unfinished plan is PAUSED when your next message has nothing to do with it: the
+ *     paused tasks stay visible (nothing is lost), the completion gate ignores them, and the
+ *     latest request becomes the goal for that turn. Asking about them again ("continue with the
+ *     docs") resumes the plan exactly as before. Continuations ("go on", "next", "do it", or any
+ *     message sharing a real word with the goal/tasks) never pause it.
+ *   - Nothing else changed: same prompt, same gate, same tools for everything else.
+ *
  * v2.12.1 — v2.12.0 + opt-in goal planning, with NO behavior change to anything else:
  *   - base-level compatibility is the point of this release: the system prompt, the completion
  *     gate, the tool schema, the read-only/approval classification and the plan prompt block are
@@ -78,7 +90,7 @@ import { exec, spawn } from "node:child_process";
 import process from "node:process";
 import { EventSource } from "eventsource";
 
-const VERSION = "2.12.1";
+const VERSION = "2.12.2";
 
 // ------------------------------------------------------------------ data folder
 const DATA_DIR = path.join(os.homedir(), ".aiterm");
@@ -243,6 +255,7 @@ function newPlan(goal = "") {
     touched: false,          // model called update_plan during this turn
     dirty: false,            // checklist changed outside update_plan — needs a reprint
     explicit: false,         // user set this goal via /plan goal — survives autoplan=off
+    paused: null,            // { goal } of an earlier plan the current request is not about
     evidence: [],            // what the planner actually saw (shown to the user, never assumed)
     reading: "",             // the planner's restatement of the goal, for display only
     announced: false,        // goal already shown to the user for this plan
@@ -270,6 +283,55 @@ function seedGoal(text) {
   return (cut > 40 ? t.slice(0, cut + 1) : t.slice(0, 160)).trim();
 }
 // Per user message: keep the counters fresh, decide whether the follow-up gate applies.
+// Does the newest message belong to this plan, or is it a new request? Continuations ("go on",
+// "next", "do it", a question about the plan) and anything sharing a real word with the goal, the
+// tasks or their ids count as the same piece of work; a message about something else does not.
+function planRelatesTo(p, text) {
+  const t = String(text || "").trim();
+  if (!t) return true;
+  if (/^(y|yes|yeah|yep|ok|okay|sure|go|go on|go ahead|continue|carry on|proceed|next|keep going|keep at it|do it|do that|finish|resume|retry|again|more)\b/i.test(t)) return true;
+  if (/\b(task|tasks|plan|steps?|goal)\b/i.test(t)) return true;
+  const q = extractKeywords(t);
+  if (!q.length) return true;
+  const hay = ((p.goal || "") + " " + (p.paused?.goal || "") + " " +
+    p.tasks.map(x => `${x.id} ${x.content} ${x.verify || ""}`).join(" ")).toLowerCase();
+  return q.some(k => k.length >= 4 && hay.includes(k));
+}
+// Park an unfinished plan when the request moves on: tasks are kept (nothing is lost, /plan still
+// lists them) but they stop steering the turn and stop arming the completion gate.
+function pausePlan(p, nextGoal) {
+  p.paused = { goal: p.goal || "" };
+  if (nextGoal) p.goal = clean(nextGoal, 400);
+  p.announced = false;          // the new request gets announced as the goal
+  p.fresh = false;
+  console.log(dim("· earlier goal paused: " + (p.paused.goal || "(unset)")) +
+              dim("  — your latest request takes priority (ask about it again to resume)"));
+  planNotify(p);
+}
+function resumePlan(p) {
+  if (!p.paused) return;
+  p.goal = p.paused.goal || p.goal;
+  p.paused = null;
+  p.announced = true;           // the old goal was already shown
+  console.log(dim("· resuming paused goal: " + (p.goal || "(unset)")));
+  planNotify(p);
+}
+// Called at the start of every turn, before the plan is armed for the new message.
+function scopePlanToRequest(userText) {
+  if (!PLAN || !PLAN.tasks.length || !planOpen(PLAN) || PLAN.explicit || !userText) return;
+  const related = planRelatesTo(PLAN, userText);
+  if (PLAN.paused) {
+    if (related) resumePlan(PLAN);
+    else {
+      const g = seedGoal(userText);            // keep the headline on the newest request
+      if (g && g !== PLAN.goal) { PLAN.goal = g; PLAN.announced = false; }
+      planNotify(PLAN);
+    }
+  } else if (!related) pausePlan(PLAN, seedGoal(userText));
+}
+// The reminder line under the checklist carries the paused state too.
+function planNotify(p) { if (p) p.dirty = false; }
+
 function startPlanTurn(goal) {
   const p = ensurePlan(goal);
   p.rounds = 0; p.calls = 0; p.mutations = 0; p.nudges = 0;
@@ -432,6 +494,18 @@ function printPlanSummary(p = PLAN) {
 // on its own implementation instead of drifting or stopping early.
 function planPromptBlock() {
   if (!PLAN || (!PLAN.tasks.length && !PLAN.goal)) return "";
+  // A paused plan describes earlier work the user has moved away from. It must not read as the
+  // current job, or the model goes back to it instead of doing what was just asked.
+  if (PLAN.paused) {
+    let s = "\n\nEARLIER PLAN — PAUSED (the user has moved on; this is NOT your job now):";
+    s += `\n  PAUSED GOAL: ${PLAN.paused.goal || "(unset)"}`;
+    for (const t of PLAN.tasks) s += `\n   ${PLAN_ICON[t.status] || "?"} [${t.id}] ${t.content}`;
+    s += "\nThe user's latest message is what you work on now: do NOT work on the paused tasks, do " +
+         "not let them change what you do, and do not ask about them. They are kept only so the " +
+         "user can return to them later.";
+    s += `\nRound trips used on this request: ${PLAN.rounds}. Batch every independent tool call into one response.`;
+    return s;
+  }
   let s = "\n\nYOUR CURRENT PLAN (you own this list — keep it truthful):";
   s += "\n" + (renderPlan(PLAN) || "  (no tasks yet)");
   const open = activeTasks();
@@ -454,6 +528,7 @@ function planPromptBlock() {
 function planGate() {
   const p = PLAN;
   if (!p || !p.armed || !p.tasks.length) return null;
+  if (p.paused) return null;   // a paused earlier plan must never chase the current request
   if (p.nudges >= MAX_PLAN_NUDGES) return null;
   const open = activeTasks(p);
   const unverified = p.tasks.filter(t => t.status === "done" && t.verify && t.unverified);
@@ -1076,6 +1151,8 @@ notes
   - everything else is unchanged from v2.12.0: a normal prompt does not get a goal, a task list,
     a confirmation prompt or an extra nudge — /plan goal is the only way in, and it pauses for
     your confirmation before the first file/command change (edit with /plan ...)
+  - an unfinished plan whose work your next message is not about is paused automatically
+    (tasks stay listed and the follow-up nudge leaves them alone; ask about them again to resume)
   - env vars: AI_URL / AI_MODEL / AI_KEY / AI_DIR
 `;
 
@@ -2592,6 +2669,9 @@ async function agentTurn(cfg, history, keys) {
   // Switched off with /set autoplan off — but an explicit `/plan goal <text>` still opts in,
   // so turning auto off does not lock you out of planning when you want it.
   const auto = cfg.autoPlan !== false;
+  // Before the plan is armed for this message: park an unfinished plan that this request is not
+  // about, or un-park one the user is returning to. Runs whatever the planning settings are.
+  scopePlanToRequest(lastUserMsg);
   const wantPlan = cfg.mode !== "ask" && (auto || PLAN?.explicit === true);
   const plan = wantPlan ? startPlanTurn(auto ? seedGoal(lastUserMsg) : "") : null;
   if (!wantPlan) tools = tools.filter(t => t.function.name !== "update_plan");
@@ -3237,6 +3317,8 @@ async function handleCommand(line, cfg, history, keys) {
         break;
       }
       console.log(renderPlan(PLAN, "  "));
+      if (PLAN.paused) console.log(dim(`  paused goal: ${PLAN.paused.goal || "(unset)"}`) +
+        dim("  — your latest request is the goal now; ask about it again to resume"));
       if (PLAN.reading) console.log(dim(`  reading: ${PLAN.reading}`));
       for (const f of (PLAN.evidence || []).slice(0, 6)) console.log(dim(`  evidence: ${f}`));
       const done = PLAN.tasks.filter(t => t.status === "done").length;

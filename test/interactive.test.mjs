@@ -285,3 +285,93 @@ test({ name: "explicit goals pause for confirmation before the first change", sk
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test({ name: "an unrelated request does not inherit an unfinished plan (and asking again resumes it)", skip: !hasScript && "needs `script` for a pty" }, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-pty5-"));
+  const home = path.join(root, "home");
+  const dir = path.join(root, "proj");
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "App.jsx"), "export const App = () => <button>Go</button>;\n");
+
+  const mock = await startMockLLM([
+    // 1. first request opens a plan about documentation
+    { toolCalls: [{ name: "update_plan", arguments: {
+      goal: "Document the project",
+      tasks: [
+        { id: "t1", content: "Write README.md documenting the project", status: "in_progress", verify: "README.md exists" },
+        { id: "t2", content: "Add docs/architecture.md", status: "pending", verify: "docs/architecture.md exists" },
+      ],
+    } }] },
+    // 2-3. it stalls: the gate nudges twice, then the turn ends with the tasks still open
+    { content: "I will start documenting." },
+    { content: "Still documenting." },
+    { content: "Documentation in progress." },
+    // 4. UNRELATED request: the button. This must be answered, not pushed back to docs.
+    { content: "Set the button to 40px tall and 120px wide." },
+    { content: "Still on the button." },
+    // 5. back to the plan: "continue with the documentation" must resume it
+    { content: "Back to documenting." },
+  ]);
+
+  const cmd = `node ${AGENT} --url ${mock.url} --model mock-model --key k --dir ${dir} --context 8000`;
+  const child = spawn("script", ["-qec", cmd, "/dev/null"], {
+    env: { ...process.env, HOME: home, NO_COLOR: "1", TERM: "dumb" },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let out = "";
+  child.stdout.on("data", c => (out += c));
+  child.stderr.on("data", c => (out += c));
+
+  try {
+    await sleep(1500);
+    child.stdin.write("make this project properly documented\r");
+    await sleep(4500);           // plan opens, two nudges, turn ends with tasks open
+    child.stdin.write("set the button height to 40px and width to 120px\r");
+    await sleep(3500);           // the unrelated request
+    child.stdin.write("continue with the documentation\r");
+    await sleep(3000);           // resuming the paused plan
+    child.stdin.write("/plan\r");
+    await sleep(800);
+    child.stdin.write("/exit\r");
+    await sleep(1000);
+    child.kill();
+    await sleep(300);
+
+    const plain = out.replace(/\r/g, "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+
+    // the earlier plan was parked, visibly, and the new request became the goal
+    assert.match(plain, /earlier goal paused: Document the project/);
+    assert.match(plain, /goal: set the button height to 40px and width to 120px/);
+
+    // the model was told the paused work is NOT its job, and was not told to continue it
+    const buttonTurn = mock.requests.findLast(r => r.messages.at(-1)?.content === "set the button height to 40px and width to 120px");
+    assert.ok(buttonTurn, "the button request reached the model");
+    const sys = buttonTurn.messages[0].content;
+    assert.match(sys, /EARLIER PLAN — PAUSED/);
+    assert.match(sys, /PAUSED GOAL: Document the project/);
+    assert.doesNotMatch(sys, /Keep going on \[t1\]/);
+    assert.match(sys, /do NOT work on the paused tasks/);
+
+    // ...so the button request is answered on its own: the answer reaches the user, and the turn
+    // ends without the doc plan pushing it back (the next request is the user's own follow-up)
+    assert.match(plain, /Set the button to 40px tall and 120px wide\./);
+    const next = mock.requests[mock.requests.indexOf(buttonTurn) + 1];
+    assert.ok(next, "the button turn ended cleanly instead of being nudged");
+    assert.equal(next.messages.at(-1).content, "continue with the documentation");
+    assert.doesNotMatch(next.messages.at(-1).content, /NOT DONE YET/,
+      "the paused doc plan must not nudge the button turn");
+
+    // nothing was thrown away: the tasks are still listed, and asking about them resumes the plan
+    assert.match(plain, /resuming paused goal: Document the project/);
+    const resumed = mock.requests.at(-1).messages[0].content;
+    assert.match(resumed, /YOUR CURRENT PLAN/);
+    assert.match(resumed, /GOAL: Document the project/);
+    assert.match(resumed, /Keep going on \[t1\]/);
+    assert.match(plain, /\[t1\] Write README\.md documenting the project/);
+  } finally {
+    try { child.kill("SIGKILL"); } catch {}
+    await mock.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
