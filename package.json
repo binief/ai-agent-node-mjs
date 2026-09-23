@@ -7,7 +7,10 @@
   "type": "module",
   "main": "agent.mjs",
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "test:harness": "node --test test/harness.test.mjs",
+    "agent": "node agent.mjs",
+    "harness": "node harness.mjs"
   },
   "dependencies": {
     "eventsource": "^4.1.1"
