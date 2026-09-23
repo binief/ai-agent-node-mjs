@@ -3,6 +3,42 @@
  * ai-agent.mjs — minimal, fully-working, self-learning terminal AI agent.
  * Node >= 18, ZERO dependencies (stdlib only).
  *
+ * v2.12.1 — bug-fix release: the agent no longer stops productive runs as "loops", and no
+ *            longer gets stuck in real ones.
+ *   - Loop detection rewritten. The old tool-call signature collapsed every nested argument
+ *     (so all update_plan status flips looked identical) and the old "content"/"dominated"
+ *     heuristics flagged normal work (same "Let me check." before different calls, running
+ *     the tests 4x between fixes). Detection is now result-aware: the same call giving the
+ *     same answer with nothing changed in between, verbatim response resends, or A-B-A-B
+ *     cycles with identical results.
+ *   - Completion gate: update_plan no longer resets the nudge counter (that made the
+ *     "NOT DONE YET" follow-up unbounded); progress earns more patience, with a hard cap.
+ *     Plan mode never nudges (open tasks are its expected end state).
+ *   - str_replace: new_str containing $&, $', $$ … was spliced through String.replace and
+ *     corrupted files; files containing the word "truncated" could not be edited at all;
+ *     trailing-whitespace-only mismatches now match; no-op edits are reported.
+ *   - Secret redaction was rewriting ordinary code before the model saw it (token: string,
+ *     pwd = process.cwd(), PWD=/home/…, authorization: Bearer …) — a coding agent cannot work
+ *     on code it cannot read. Values are masked only when they look like secrets; dummies
+ *     are never masked twice; minimum dummy length raised so restore cannot hit real content.
+ *   - Transcript consistency: ctrl+c mid-batch, loop stops and failure stops left tool_calls
+ *     without results, after which every request failed with HTTP 400. Every call now gets a
+ *     result; histories are repaired before each request and after errors.
+ *   - shell: commands are spawned in their own process group and the whole tree is killed
+ *     on timeout/ctrl+c (killing `sh -c` alone left `sleep`/servers holding the pipes);
+ *     malformed JSON arguments are no longer executed as a command.
+ *   - Context: a context overflow no longer permanently shrinks the saved context setting;
+ *     trimming keeps the current request and shortens old tool output first.
+ *   - Streaming: replies are routed by content-type (a JSON body to a stream request was
+ *     silently dropped line by line); "tools unsupported" fallback is per-session and no
+ *     longer persists tools=false; history-shape 400s are repaired and retried.
+ *   - MCP: legacy SSE transport actually works (responses arrive as SSE `message` events,
+ *     POST is only acknowledged); `eventsource` is loaded on demand; tool names are
+ *     sanitized for the function-name charset; curl/wget to localhost is never blocked and
+ *     non-search MCP servers no longer block curl at all.
+ *   - System prompt tells the model the real shell (POSIX vs cmd.exe) instead of always
+ *     "cmd-style"; read-only command detection understands redirections and chains.
+ *
  * v2.12.0 — v2.11.0 + configurable streaming:
  *   - `/set stream <on|off>` (default on) — also `--stream on|off` / `--no-stream` and
  *     env AI_STREAM. When off, the model endpoint is called with `"stream": false` and the
@@ -62,11 +98,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
-import { exec, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import process from "node:process";
-import { EventSource } from "eventsource";
 
-const VERSION = "2.12.0";
+const VERSION = "2.12.1";
+
+// EventSource is only needed for MCP servers using the legacy SSE transport. Node has no
+// built-in one, so it is loaded on demand — a missing `eventsource` package must not stop
+// the agent from starting.
+async function loadEventSource() {
+  if (typeof globalThis.EventSource === "function") return globalThis.EventSource;
+  try { return (await import("eventsource")).EventSource; }
+  catch { throw new Error("SSE transport needs the 'eventsource' package (npm install eventsource) or use \"type\": \"http\""); }
+}
 
 // ------------------------------------------------------------------ data folder
 const DATA_DIR = path.join(os.homedir(), ".aiterm");
@@ -140,7 +184,7 @@ const SYS_PROMPT =
   "12. ERROR LIMIT: if the same fix fails repeatedly, mark that task blocked with the reason, finish everything else, then explain the blocker + options to the user instead of looping.\n" +
   "13. ITERATE WITHOUT REPEATING: after each tool call, continue from where you left off. NEVER repeat the same tool call with the same arguments. NEVER output the same text twice in a row. If you notice you're going in circles, STOP and explain what's happening.\n" +
   "\n" +
-  "SHELLS: use cmd-style commands; PowerShell is blocked. Use background=true for dev servers/watchers.\n" +
+  "SHELLS: use background=true for dev servers/watchers; PowerShell is blocked.\n" +
   "NO COMMENTS: never add filler/explanatory comments to code unless asked.\n" +
   "MEMORY: use `remember` to persist lessons/preferences/workarounds; check recalled memories for past solutions to similar problems.\n" +
   "SAFETY: avoid destructive commands unless clearly required; never hardcode secrets; refuse harmful/illegal requests briefly.\n" +
@@ -151,58 +195,97 @@ const SYS_PROMPT =
 const MAX_FAIL_STREAK = 3;
 
 // ------------------------------------------------------------------ loop detection
-// Tracks recent assistant outputs and tool calls to detect repetition loops.
-const LOOP_WINDOW = 6;          // look at last N assistant turns
-const LOOP_CONTENT_THRESHOLD = 4; // N identical/similar content blocks → loop
-const LOOP_TOOL_THRESHOLD = 4;    // N identical tool calls → loop
-const LOOP_CYCLE_MIN = 2;         // min cycle length to detect repeating patterns
-const LOOP_CYCLE_MAX = 3;         // max cycle length to check
+// A "loop" is the model repeating work that cannot produce anything new. Repetition alone is
+// NOT a loop: a normal turn re-runs the test suite after every fix, flips update_plan statuses
+// a dozen times and prefixes every tool call with the same "Let me check." — all of that must
+// pass. So detection looks at (tool call + its result) pairs and only fires when the same call
+// keeps producing the same answer with nothing changed in between, or when the model resends
+// the exact same response over and over.
+const LOOP_WINDOW = 30;            // executed tool calls kept for analysis
+const LOOP_RESPONSE_REPEAT = 4;    // identical whole responses (text + calls) in a row → loop
+const LOOP_SAME_RESULT_REPEAT = 3; // identical (call, result) pairs in a row → loop
+const LOOP_ANY_RESULT_REPEAT = 5;  // identical calls in a row even if results differ → loop
+const LOOP_CYCLE_MIN = 2;          // A-B-A-B-A-B style cycles: min/max cycle length
+const LOOP_CYCLE_MAX = 6;
+const LOOP_CYCLE_REPS = 3;         // a cycle must repeat this many times
+const LOOP_STALE_REPEAT = 4;       // same (call, result) N times with no mutation between → loop
 
+// Deterministic JSON with keys sorted at EVERY level, so {a:1,b:2} and {b:2,a:1} match but
+// nested content still counts (a status flip on t1 and on t2 must NOT look identical).
+function canonicalJson(v) {
+  if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
+  if (v && typeof v === "object")
+    return "{" + Object.keys(v).sort().map(k => JSON.stringify(k) + ":" + canonicalJson(v[k])).join(",") + "}";
+  return JSON.stringify(v) ?? "null";
+}
 function contentSignature(text) {
-  // Normalize whitespace and take a fingerprint (first 500 chars is enough to detect repetition)
   return String(text || "").replace(/\s+/g, " ").trim().slice(0, 500);
 }
-
 function toolCallSignature(name, argsStr) {
-  // Normalize: sort JSON keys so {a:1,b:2} and {b:2,a:1} match
-  let normalized = argsStr || "{}";
-  try { normalized = JSON.stringify(JSON.parse(normalized), Object.keys(JSON.parse(normalized)).sort()); } catch {}
+  let normalized = String(argsStr || "{}");
+  try { normalized = canonicalJson(JSON.parse(normalized)); } catch { normalized = normalized.trim(); }
   return `${name}(${normalized})`;
 }
+// Numbers and whitespace are noise (durations, pids, timestamps, byte counts) — strip them so
+// "tests: 3 passed (152ms)" and "tests: 3 passed (161ms)" count as the same result.
+function resultSignature(text) {
+  return String(text || "").replace(/\d+/g, "#").replace(/\s+/g, " ").trim().slice(0, 2000);
+}
+// Does this call change the project (so a repeated read afterwards is legitimately new)?
+function isMutatingCall(name, args) {
+  if (name === "write_file" || name === "str_replace") return true;
+  if (name === "shell") return !isReadOnlyCommand(String(args?.command || args?._raw || ""));
+  if (mcpRegistry.has(name)) return /write|create|update|delete|remove|edit|move|rename|insert|put|post|patch|set|run|exec|install|apply|commit|push|send/i.test(name);
+  return false;
+}
 
-function detectLoop(recentSigs) {
-  if (recentSigs.length < LOOP_CONTENT_THRESHOLD) return null;
+// `entries`: executed calls, oldest first, each { sig, res, mut }.
+function detectToolLoop(entries) {
+  const n = entries.length;
+  if (n < LOOP_SAME_RESULT_REPEAT) return null;
+  const last = entries[n - 1];
 
-  // 1. Exact repetition: the same thing N times in a row
-  const last = recentSigs[recentSigs.length - 1];
-  let exactCount = 0;
-  for (let i = recentSigs.length - 1; i >= 0; i--) {
-    if (recentSigs[i] === last) exactCount++;
-    else break;
+  // 1. The same call again and again, back to back. A command that explicitly waits/polls
+  //    (sleep, ping, timeout …) is expected to be repeated a few times → lenient threshold.
+  let sameCall = 0, sameCallAndResult = 0, streak = true;
+  for (let i = n - 1; i >= 0 && entries[i].sig === last.sig; i--) {
+    sameCall++;
+    if (streak && entries[i].res === last.res) sameCallAndResult++; else streak = false;
   }
-  if (exactCount >= LOOP_CONTENT_THRESHOLD) return `exact-repeat (${exactCount}x)`;
+  const sameResultLimit = last.wait ? LOOP_ANY_RESULT_REPEAT : LOOP_SAME_RESULT_REPEAT;
+  if (sameCallAndResult >= sameResultLimit) return `same call + same result ${sameCallAndResult}x in a row`;
+  if (sameCall >= LOOP_ANY_RESULT_REPEAT) return `same call ${sameCall}x in a row`;
 
-  // 2. Cycle detection: A-B-A-B or A-B-C-A-B-C patterns
-  for (let cycleLen = LOOP_CYCLE_MIN; cycleLen <= LOOP_CYCLE_MAX; cycleLen++) {
-    if (recentSigs.length < cycleLen * 2) continue;
-    const tail = recentSigs.slice(-cycleLen * 2);
-    let isCycle = true;
-    for (let i = 0; i < cycleLen; i++) {
-      if (tail[i] !== tail[i + cycleLen]) { isCycle = false; break; }
-    }
-    if (isCycle) return `cycle (length ${cycleLen}, ${tail.length / cycleLen} repetitions)`;
+  // 2. A-B-A-B-A-B (or longer) cycles with identical results every time round.
+  const key = e => e.sig + "\u0000" + e.res;
+  for (let L = LOOP_CYCLE_MIN; L <= LOOP_CYCLE_MAX; L++) {
+    const span = L * LOOP_CYCLE_REPS;
+    if (n < span) break;
+    const tail = entries.slice(-span);
+    let cyc = true;
+    for (let i = L; i < span && cyc; i++) if (key(tail[i]) !== key(tail[i - L])) cyc = false;
+    // a cycle made of one repeated call is case 1; require ≥2 distinct calls
+    if (cyc && new Set(tail.slice(0, L).map(key)).size > 1)
+      return `cycle of ${L} calls repeated ${LOOP_CYCLE_REPS}x with identical results`;
   }
 
-  // 3. High overlap: most of the last N are identical (e.g. 4 out of 6)
-  const freq = new Map();
-  for (const s of recentSigs) freq.set(s, (freq.get(s) || 0) + 1);
-  const maxFreq = Math.max(...freq.values());
-  if (maxFreq >= LOOP_CONTENT_THRESHOLD) {
-    const dominated = [...freq.entries()].find(([, v]) => v === maxFreq)?.[0];
-    if (dominated && dominated === last) return `dominated (${maxFreq}/${recentSigs.length} identical)`;
+  // 3. The same call keeps giving the same answer while nothing was changed in between.
+  let first = -1, count = 0;
+  for (let i = 0; i < n; i++) {
+    if (entries[i].sig === last.sig && entries[i].res === last.res) { count++; if (first < 0) first = i; }
   }
+  const staleLimit = last.wait ? LOOP_ANY_RESULT_REPEAT + 1 : LOOP_STALE_REPEAT;
+  if (count >= staleLimit && !entries.slice(first, n).some(e => e.mut))
+    return `same call + same result ${count}x with no changes in between`;
 
   return null;
+}
+// Whole responses (text + tool calls) resent verbatim.
+function detectResponseLoop(sigs) {
+  const n = sigs.length;
+  if (n < LOOP_RESPONSE_REPEAT) return null;
+  for (let i = n - LOOP_RESPONSE_REPEAT; i < n; i++) if (sigs[i] !== sigs[n - 1]) return null;
+  return `identical response ${LOOP_RESPONSE_REPEAT}x in a row`;
 }
 
 // ------------------------------------------------------------------ goal & task tracking
@@ -214,7 +297,8 @@ function detectLoop(recentSigs) {
 const TASK_STATUS = ["pending", "in_progress", "done", "blocked", "skipped"];
 const ACTIVE_STATUS = new Set(["pending", "in_progress"]);
 const PLAN_ICON = { pending: "☐", in_progress: "◐", done: "✓", blocked: "✗", skipped: "‒" };
-const MAX_PLAN_NUDGES = 2;   // how many times the completion gate pushes back per turn
+const MAX_PLAN_NUDGES = 2;   // consecutive pushbacks without progress before the gate lets go
+const MAX_PLAN_NUDGES_TOTAL = 6; // hard cap per user message, progress or not — never loop forever
 const MAX_PLAN_TASKS = 24;
 
 let PLAN = null;             // session-scoped: { goal, tasks[], rounds, calls, nudges, armed, … }
@@ -226,7 +310,9 @@ function newPlan(goal = "") {
     rounds: 0,               // model round trips for the current user message
     calls: 0,                // tool calls executed for the current user message
     mutations: 0,            // mutating tool calls for the current user message
-    nudges: 0,               // completion-gate pushbacks used this turn
+    nudges: 0,               // consecutive completion-gate pushbacks without progress
+    nudgesTotal: 0,          // all pushbacks this turn (hard-capped)
+    resolvedAtNudge: 0,      // resolved-task count when the gate last pushed back
     armed: false,            // gate is armed once the model engages the plan or starts changing files
     touched: false,          // model called update_plan during this turn
     dirty: false,            // checklist changed outside update_plan — needs a reprint
@@ -245,6 +331,10 @@ function resetPlan() { PLAN = null; }
 function planTasks(p = PLAN) { return p ? p.tasks : []; }
 function activeTasks(p = PLAN) { return planTasks(p).filter(t => ACTIVE_STATUS.has(t.status)); }
 function planOpen(p = PLAN) { return activeTasks(p).length; }
+// done + blocked + skipped, minus done-but-unverified: the gate's measure of real progress
+function resolvedTasks(p = PLAN) {
+  return planTasks(p).filter(t => !ACTIVE_STATUS.has(t.status) && !(t.status === "done" && t.verify && t.unverified)).length;
+}
 // First-cut goal taken straight from the user's prompt, so the tracker always has one even if
 // the model never calls update_plan. The model refines it on its first update_plan call.
 function seedGoal(text) {
@@ -257,7 +347,8 @@ function seedGoal(text) {
 // Per user message: keep the counters fresh, decide whether the follow-up gate applies.
 function startPlanTurn(goal) {
   const p = ensurePlan(goal);
-  p.rounds = 0; p.calls = 0; p.mutations = 0; p.nudges = 0;
+  p.rounds = 0; p.calls = 0; p.mutations = 0; p.nudges = 0; p.nudgesTotal = 0;
+  p.resolvedAtNudge = resolvedTasks(p);
   p.touched = false; p.armed = planTasks(p).length > 0;   // open work from earlier ⇒ stay on it
   // A goal must be visible even if the model never opens a task list. Announce once per
   // plan, whether it was derived from the prompt just now or set earlier via /plan goal.
@@ -316,7 +407,9 @@ function applyPlanUpdate(a, cfg) {
   const ranSinceLast = p.sinceUpdate.shell;
   p.touched = true;
   p.armed = true;
-  p.nudges = 0;
+  // NOTE: the nudge counter is deliberately NOT reset here. Resetting it on every update_plan
+  // let a model bounce forever between "Done." → nudge → status flip → "Done." → nudge …
+  // planGate() resets it only when tasks actually get resolved.
   p.sinceUpdate.shell = 0;
 
   if (Array.isArray(a?.tasks) && a.tasks.length) {
@@ -427,13 +520,20 @@ function planPromptBlock() {
 
 // Completion gate: returns a follow-up instruction when the model tried to stop with work open,
 // or null when it is allowed to end the turn.
-function planGate() {
+function planGate(cfg) {
   const p = PLAN;
   if (!p || !p.armed || !p.tasks.length) return null;
-  if (p.nudges >= MAX_PLAN_NUDGES) return null;
+  // Plan mode only produces the checklist — the tasks are meant to stay open until the user
+  // switches to code mode, so pushing the model to "finish" them would only make it loop.
+  if (cfg?.mode === "plan") return null;
   const open = activeTasks(p);
   const unverified = p.tasks.filter(t => t.status === "done" && t.verify && t.unverified);
   if (!open.length && !unverified.length) return null;
+  // Progress since the last pushback (tasks resolved) earns fresh patience; no progress ends the turn.
+  const resolved = resolvedTasks(p);
+  if (resolved > p.resolvedAtNudge) { p.nudges = 0; p.resolvedAtNudge = resolved; }
+  if (p.nudges >= MAX_PLAN_NUDGES || p.nudgesTotal >= MAX_PLAN_NUDGES_TOTAL) return null;
+  p.nudges++; p.nudgesTotal++;   // this call IS a pushback
   const parts = [];
   if (open.length) {
     parts.push(`${open.length} task(s) still open: ` + open.map(t => `[${t.id}] ${t.content}`).join(" | "));
@@ -565,7 +665,9 @@ notes
   - data folder: ${DATA_DIR}  (config, mcp, memory, commands, sessions)
   - MCP servers: edit ${MCP_PATH}
   - the agent stops after ${MAX_FAIL_STREAK} consecutive tool failures to avoid damage
-  - loop detection: automatically stops if the model repeats the same output or tool calls
+  - loop detection: stops when the same tool call keeps returning the same result with nothing
+    changed in between, or the model resends the exact same response (re-running tests after
+    each fix and updating the plan checklist are NOT loops)
   - tools: update_plan, shell, read_file, str_replace, write_file, remember, forget, + MCP tools
   - the agent sets a goal from your prompt, splits it into tasks, works them to done,
     and refuses to stop while tasks are still open (follow-up nudge, max ${MAX_PLAN_NUDGES}x)
@@ -647,57 +749,101 @@ function osDescription() {
 // str_replace. Nothing in the system prompt, HELP, or /config reveals this exists.
 let _secretStore = null;      // { dummy: real }
 let _realToDummy = null;      // Map<real, dummy>
+let _restoreRe = null;        // one alternation over all dummies, rebuilt when the store changes
+const SECRET_STORE_CAP = 5000;
+const DUMMY_MIN_LEN = 8;      // 62^8 ≈ 2e14 — short dummies collided with real file content on restore
 
 function loadSecretStore() {
   if (_secretStore) return;
   let d = {};
   try { d = JSON.parse(fs.readFileSync(SECRETS_PATH, "utf8")).dummies || {}; } catch {}
+  const keys = Object.keys(d);
+  if (keys.length > SECRET_STORE_CAP) for (const k of keys.slice(0, keys.length - SECRET_STORE_CAP)) delete d[k];
   _secretStore = d;
   _realToDummy = new Map();
   for (const [k, v] of Object.entries(_secretStore)) _realToDummy.set(v, k);
+  _restoreRe = null;
 }
 function saveSecretStore() {
   try { fs.writeFileSync(SECRETS_PATH, JSON.stringify({ dummies: _secretStore }, null, 2), { mode: 0o600 }); } catch {}
 }
-// length-preserving alphanumeric dummy (min 4) — looks natural in place
+// length-preserving alphanumeric dummy — looks natural in place
 function genDummy(len) {
   const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  const n = Math.max(len || 0, 4);
+  const n = Math.max(len || 0, DUMMY_MIN_LEN);
   let s = "";
   for (let i = 0; i < n; i++) s += chars[Math.floor(Math.random() * chars.length)];
   return s;
 }
 function dummyFor(real) {
   loadSecretStore();
+  if (_secretStore[real] !== undefined) return real;   // already a dummy — never mask twice
   let d = _realToDummy.get(real);
   if (!d) {
     do { d = genDummy(real.length); } while (_secretStore[d]);
     _secretStore[d] = real;
     _realToDummy.set(real, d);
+    _restoreRe = null;
     saveSecretStore();
   }
   return d;
 }
 function restoreSecrets(text) {
   loadSecretStore();
-  let t = String(text);
-  const entries = Object.entries(_secretStore).sort((a, b) => b[0].length - a[0].length);
-  for (const [d, r] of entries) t = t.split(d).join(r);
-  return t;
+  const t = String(text);
+  const dummies = Object.keys(_secretStore);
+  if (!dummies.length) return t;
+  if (!_restoreRe) {
+    const alt = dummies.sort((a, b) => b.length - a.length).map(d => d.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+    _restoreRe = new RegExp(alt, "g");
+  }
+  // a couple of passes in case an older store nested dummies (dummy of a dummy)
+  let out = t;
+  for (let i = 0; i < 3; i++) {
+    const next = out.replace(_restoreRe, m => _secretStore[m] ?? m);
+    if (next === out) break;
+    out = next;
+  }
+  return out;
 }
+// Things that sit after `password =` / `token:` in ordinary code and must NOT be masked:
+// type names, keywords, placeholders, env lookups, function calls, paths, template holes.
+const NOT_A_SECRET = /^(true|false|null|none|nil|undefined|nan|string|str|text|int|integer|number|float|bool|boolean|object|any|unknown|void|required|optional|redacted|changeme|change_me|placeholder|example|sample|dummy|test|password|secret|token|bearer|basic|digest|hoba|mutual|negotiate|ntlm|oauth|xxx+|\*+|\.{3,}|-+|_+|<[^>]*>|\$\{?[A-Za-z_][\w.]*\}?|%[A-Za-z_]\w*%|your[_-]\w+|<?your[\w -]*>?)[;,]?$/i;
+const CODE_EXPR = /[()[\]{}]|^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)+;?$|^[\/~]|^[A-Za-z]:\\|^\.{1,2}[\/\\]|^(new|await|this|self|os|process|env|require|import|typeof)\b/;
+function looksSecretLike(v, strong) {
+  const s = String(v).replace(/[;,]$/, "");
+  if (s.length < (strong ? 6 : 8) || s.length > 512) return false;
+  if (NOT_A_SECRET.test(s) || CODE_EXPR.test(s)) return false;
+  if (/\s/.test(s)) return false;
+  // strong keywords (password/api_key/…): anything that is not obviously code counts
+  if (strong) return true;
+  // weak keywords (token/pwd/…): need some entropy — digits, symbols, or long mixed case
+  return /\d/.test(s) || /[^A-Za-z0-9]/.test(s) || (s.length >= 20 && /[a-z]/.test(s) && /[A-Z]/.test(s));
+}
+const SECRET_KEYS_STRONG = "password|passwd|passphrase|secret|api[_-]?key|private[_-]?key|client[_-]?secret|secret[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|bearer[_-]?token";
+const SECRET_KEYS_WEAK = "pwd|token|access[_-]?key|credential|session[_-]?id|authorization";
 function maskSecrets(text, cfg) {
   if (!cfg || cfg.redact === false) return String(text);
   let t = String(text);
-  t = t.replace(/(:\/\/[^:\s\/@]+:)([^@\s]+)(@)/g, (m, pre, pass, at) => pre + dummyFor(pass) + at);
+  // URL credentials: scheme://user:pass@host — never a port/path (those have no '@' user part)
+  t = t.replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^:\s\/@]+:)([^@\s\/]+)(@)/gi, (m, pre, pass, at) => pre + dummyFor(pass) + at);
+  // well-known token shapes
   t = t.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, m => dummyFor(m));
   t = t.replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, m => dummyFor(m));
-  t = t.replace(/\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9]{16,}\b/g, m => dummyFor(m));
+  t = t.replace(/\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{16,}\b/g, m => dummyFor(m));
   t = t.replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, m => dummyFor(m));
   t = t.replace(/\bAIza[0-9A-Za-z_-]{35}\b/g, m => dummyFor(m));
-  t = t.replace(/(Bearer\s+)([A-Za-z0-9._~+/=-]{16,})/gi, (m, pre, tok) => pre + dummyFor(tok));
-  const K = "password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|authorization|credential|session[_-]?id";
-  t = t.replace(new RegExp(`((?:${K})["']?\\s*[:=]\\s*)(["'])([^"']+)\\2`, "gi"), (m, pre, q, val) => pre + q + dummyFor(val) + q);
-  t = t.replace(new RegExp(`((?:${K})["']?\\s*[:=]\\s*)([^\\s"']+)`, "gi"), (m, pre, val) => pre + dummyFor(val));
+  t = t.replace(/\bsk-(?:proj-|live-|test-|ant-)?[A-Za-z0-9_-]{20,}\b/g, m => dummyFor(m));
+  t = t.replace(/(Bearer\s+)([A-Za-z0-9._~+/=-]{16,})/g, (m, pre, tok) => looksSecretLike(tok, false) ? pre + dummyFor(tok) : m);
+  // key = value / key: value / key="value" — only when the value itself looks like a secret
+  const kv = (keys, strong) => {
+    t = t.replace(new RegExp(`((?:${keys})["']?\\s*[:=]\\s*)(["'])([^"'\\n]+)\\2`, "gi"),
+      (m, pre, q, val) => looksSecretLike(val, strong) ? pre + q + dummyFor(val) + q : m);
+    t = t.replace(new RegExp(`((?:${keys})["']?\\s*[:=]\\s*)([^\\s"',;]+)`, "gi"),
+      (m, pre, val) => looksSecretLike(val, strong) ? pre + dummyFor(val) : m);
+  };
+  kv(SECRET_KEYS_STRONG, true);
+  kv(SECRET_KEYS_WEAK, false);
   return t;
 }
 // keep the dummy->real mapping undiscoverable by the model
@@ -710,20 +856,31 @@ const DEFAULT_BLOCKED = [
   "^\\s*powershell(\\.exe)?(\\s|$)",
   "^\\s*pwsh(\\.exe)?(\\s|$)",
 ];
-const WEB_FETCH_SHELL = /\b(curl|wget|httpie|Invoke-WebRequest|\biwr\b|lynx|w3m)\b/i;
+const WEB_FETCH_SHELL = /(^|[\s;&|(])(curl|wget|httpie|http|Invoke-WebRequest|iwr|lynx|w3m)(\.exe)?(\s|$)/i;
+const LOCAL_HOST_RE = /^(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[?::1\]?|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|[^.\s/:]+\.(local|internal|test))$/i;
 function mcpSearchToolsListed() {
   for (const name of mcpRegistry.keys()) {
     if (/search|web_|web-|fetch|page-content|exa|brave|tavily/i.test(name)) return true;
   }
-  return mcpRegistry.size > 0;
+  return false;   // other MCP servers (filesystem, db, …) are no reason to block curl
 }
+// curl/wget against the public internet is redirected to the web MCP tools when there are
+// any; hitting a local dev server (curl localhost:3000/health) must always stay allowed.
+function fetchesRemoteUrl(cmd) {
+  const urls = String(cmd).match(/https?:\/\/[^\s"'<>)]+/gi) || [];
+  if (!urls.length) return /\b(curl|wget)\b\s+[^-\s][^\s]*\.[a-z]{2,}(\/|\s|$)/i.test(cmd);  // curl example.com
+  return urls.some(u => { try { return !LOCAL_HOST_RE.test(new URL(u).hostname); } catch { return true; } });
+}
+// Downloading an artifact (curl -o …, wget -O …, … | tar) is not something a web-search MCP
+// can do — only page/API *reading* is redirected.
+const DOWNLOADS_FILE = /(^|\s)-[a-zA-Z]*[oO]\b|--output|--remote-name|>\s*\S|\|\s*(tar|unzip|gunzip|sh|bash|python3?|node)\b/;
 function checkCommandPolicy(cmd, cfg) {
   const c = String(cmd).trim();
-  if (mcpSearchToolsListed() && WEB_FETCH_SHELL.test(c)) {
+  if (mcpSearchToolsListed() && WEB_FETCH_SHELL.test(c) && fetchesRemoteUrl(c) && !DOWNLOADS_FILE.test(c)) {
     const names = [...mcpRegistry.keys()].join(", ");
     return {
       allowed: false,
-      pattern: "curl/wget blocked — use MCP: " + names,
+      pattern: "curl/wget to the internet blocked — use MCP: " + names,
     };
   }
   for (const pat of (cfg.blockedCommands || DEFAULT_BLOCKED)) {
@@ -742,11 +899,21 @@ const DANGEROUS = [
   /\b(shutdown|reboot|halt|poweroff|init\s+[06])\b/i,
 ];
 const READONLY = [
-  /^(ls|ll|dir|pwd|cd|cat|type|echo|which|where|whoami|hostname|date|stat|file|wc|head|tail|tree|findstr)\b/i,
-  /^git\s+(status|log|diff|show|branch|remote|ls-files)\b/i,
-  /^(npm|yarn|pnpm)\s+(ls|list|outdated|view|why)\b/i,
-  /^(node|python3?)\s+--version\b/i,
+  /^(ls|ll|dir|pwd|cd|cat|type|echo|which|where|whoami|hostname|date|stat|file|wc|head|tail|tree|findstr|grep|egrep|rg|find|fd|ps|env|printenv|uname|id|uptime|df|du|free|less|more|sort|uniq|diff|cmp|md5sum|sha\d*sum|realpath|readlink|basename|dirname|nproc|lsb_release|sw_vers|ver|systeminfo|tasklist|netstat|ss|lsof)\b/i,
+  /^git\s+(status|log|diff|show|branch|remote|ls-files|blame|grep|rev-parse|describe|tag|stash\s+list|config\s+--get)\b/i,
+  /^(npm|yarn|pnpm|bun)\s+(ls|list|outdated|view|why|info|--version|-v)\b/i,
+  /^(node|python3?|pip3?|go|cargo|rustc|java|javac|dotnet|ruby|php|deno|bun|tsc)\s+(--version|-version|-v|version|-V)\b/i,
+  /^(pip3?\s+(list|show|freeze)|cargo\s+(tree|metadata)|go\s+(env|list)|docker\s+(ps|images|logs|inspect))\b/i,
 ];
+// Redirections and pipes into writers turn a read-only command into a mutating one.
+const WRITES_OUTPUT = /(^|[^<>|])>{1,2}(?!&\d)|\|\s*(tee|sponge|xargs\s+rm|dd)\b/;
+function isReadOnlyCommand(cmd) {
+  const c = String(cmd || "").trim();
+  if (!c) return false;
+  // every segment of a && / ; / | chain must be read-only
+  const segs = c.split(/\s*(?:&&|\|\||;|\|)\s*/).filter(Boolean);
+  return !WRITES_OUTPUT.test(c) && segs.every(s => READONLY.some(re => re.test(s)));
+}
 function classifyTool(name, args) {
   if (mcpRegistry.has(name)) return "auto";
   if (name === "read_file") return "auto";
@@ -754,12 +921,16 @@ function classifyTool(name, args) {
   if (name === "shell") {
     const c = String(args.command || args._raw || "").trim();
     if (DANGEROUS.some(re => re.test(c))) return "block";
-    if (READONLY.some(re => re.test(c))) return "auto";
+    if (isReadOnlyCommand(c)) return "auto";
     return "ask";
   }
   return "ask";
 }
 async function confirmTool(name, args, keys) {
+  if (typeof keys?.key !== "function") {   // piped / one-shot mode has no keyboard to ask
+    console.log("  " + yellow("⚠ intercept is on but there is no terminal to confirm — skipped ") + dim("(run without --intercept or /set intercept off)"));
+    return "no";
+  }
   process.stdout.write("  " + yellow("⚠ run? ") + dim(fmtCall(name, args)) +
                        dim("  — [y]es  [n]o  [a]lways-yes: "));
   for (;;) {
@@ -926,31 +1097,46 @@ class McpClient {
     if (this.transport === "sse") await this._establishSse(this.cfg.url);
   }
   async _establishSse(baseUrl) {
+    const ES = await loadEventSource();
     return new Promise((resolve, reject) => {
+      let settled = false;
       const timeout = setTimeout(() => {
-        if (this.sseSource) this.sseSource.close();
+        if (settled) return;
+        settled = true;
+        try { this.sseSource?.close(); } catch {}
         reject(new Error("SSE connection timeout"));
       }, 30000);
-      const sseUrl = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/";
-      this.sseSource = new EventSource(sseUrl);
-      this.sseSource.onerror = () => {
-        clearTimeout(timeout);
-        this.sseSource.close();
-        reject(new Error("SSE connection failed"));
+      // legacy SSE transport: GET <url> → "endpoint" event → POST messages there; the
+      // JSON-RPC responses come back on this same stream as "message" events
+      this.sseSource = new ES(baseUrl, this.cfg.headers ? { fetch: (u, o) => fetch(u, { ...o, headers: { ...(o?.headers || {}), ...this.cfg.headers } }) } : undefined);
+      this.sseSource.onerror = (e) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          try { this.sseSource.close(); } catch {}
+          reject(new Error("SSE connection failed" + (e?.message ? `: ${e.message}` : "")));
+        } else {
+          this._failAll(new Error("SSE connection lost"));
+        }
       };
       this.sseSource.addEventListener("endpoint", (e) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timeout);
         try {
-          const data = typeof e.data === "string" ? (() => { try { return JSON.parse(e.data); } catch { return e.data; } })() : e.data;
-          this.sseEndpoint = typeof data === "string" ? data : (data.endpoint || this.cfg.url);
-          if (!this.sseEndpoint.startsWith("http")) {
-            this.sseEndpoint = new URL(this.sseEndpoint, baseUrl).toString();
-          }
+          const raw = String(e.data || "").trim();
+          let data = raw; try { data = JSON.parse(raw); } catch {}
+          this.sseEndpoint = typeof data === "string" ? data : (data.endpoint || data.uri || data.url || this.cfg.url);
+          if (!/^https?:\/\//i.test(this.sseEndpoint)) this.sseEndpoint = new URL(this.sseEndpoint, baseUrl).toString();
           resolve();
         } catch (err) {
-          this.sseSource.close();
+          try { this.sseSource.close(); } catch {}
           reject(err);
         }
+      });
+      this.sseSource.addEventListener("message", (e) => {
+        let msg; try { msg = JSON.parse(e.data); } catch { return; }
+        if (Array.isArray(msg)) msg.forEach(m => this._dispatch(m)); else this._dispatch(msg);
       });
     });
   }
@@ -999,17 +1185,21 @@ class McpClient {
     });
     const sid = res.headers.get("mcp-session-id") || res.headers.get("Mcp-Session-Id");
     if (sid) this.httpSession = sid;
-    if (msg.id === undefined) return; // notification
+    if (!res.ok) throw new Error(`MCP HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 200)}`);
+    if (msg.id === undefined) { await res.text().catch(() => {}); return; } // notification
+    const text = await res.text();
+    // legacy SSE transport: the POST is just acknowledged (202/empty) and the actual response
+    // arrives on the event stream → nothing to dispatch here
+    if (!text.trim()) {
+      if (this.transport === "sse" || res.status === 202) return;
+      throw new Error(`MCP HTTP ${res.status} empty body`);
+    }
     const ct = res.headers.get("content-type") || "";
     let data;
-    if (ct.includes("text/event-stream")) data = parseSseJsonRpc(await res.text());
-    else {
-      const text = await res.text();
-      try { data = JSON.parse(text); }
-      catch { data = parseSseJsonRpc(text); }
-    }
-    if (!data) throw new Error(`MCP HTTP ${res.status} empty body`);
-    this._dispatch(data);
+    if (ct.includes("text/event-stream")) data = parseSseJsonRpc(text);
+    else { try { data = JSON.parse(text); } catch { data = parseSseJsonRpc(text); } }
+    if (!data) { if (this.transport === "sse") return; throw new Error(`MCP HTTP ${res.status}: unreadable body`); }
+    if (Array.isArray(data)) data.forEach(d => this._dispatch(d)); else this._dispatch(data);
   }
   request(method, params, timeoutMs = 30000) {
     const id = this.nextId++;
@@ -1057,10 +1247,15 @@ async function connectMcp() {
       await client.initialize();
       const tools = await client.listTools();
       mcpClients.set(sname, client);
+      // OpenAI-style function names must match ^[A-Za-z0-9_-]{1,64}$ — anything else makes the
+      // whole request fail with 400 and would take every tool down with it.
+      const fnName = s => String(s).replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64) || "tool";
       for (const t of tools) {
-        let exposed = t.name;
+        let exposed = fnName(t.name);
         if (TOOLS.some(x => x.function.name === exposed) || mcpRegistry.has(exposed))
-          exposed = `${sname}__${t.name}`;
+          exposed = fnName(`${sname}__${t.name}`);
+        let n = 2; const base = exposed;
+        while (mcpRegistry.has(exposed)) exposed = fnName(`${base.slice(0, 60)}_${n++}`);
         mcpRegistry.set(exposed, { client, realName: t.name, schema: t });
       }
       console.log(dim(`✓ MCP '${sname}' connected (${tools.length} tools)`));
@@ -1115,7 +1310,10 @@ function loadCfg() {
   return cfg;
 }
 function saveCfg(cfg) {
-  try { fs.writeFileSync(CFG_PATH, JSON.stringify(cfg, null, 2), { mode: 0o600 }); } catch {}
+  // keys starting with "_" are per-session runtime state (e.g. a server that rejected
+  // stream_options or tools) and must not stick to the next session
+  const persisted = Object.fromEntries(Object.entries(cfg).filter(([k]) => !k.startsWith("_")));
+  try { fs.writeFileSync(CFG_PATH, JSON.stringify(persisted, null, 2), { mode: 0o600 }); } catch {}
 }
 // NOTE: intentionally says NOTHING about secret masking — the model must never
 // learn that values are substituted. Round-tripping handles it transparently.
@@ -1128,7 +1326,8 @@ const systemPrompt = (cfg, userPrompt = "") => {
   } else {
     s = cfg.system || SYS_PROMPT;
   }
-  s += `\nOperating system: ${osDescription()} · shell: ${SHELL_NAME}. Use ONLY commands valid for this OS and shell.`;
+  s += `\nOperating system: ${osDescription()} · shell: ${SHELL_NAME}. Use ONLY commands valid for this OS and shell` +
+    (IS_WIN ? " (cmd.exe syntax: dir, type, findstr, set VAR=…; not bash, not PowerShell)." : " (POSIX sh syntax: ls, cat, grep, export VAR=…; not cmd.exe, not PowerShell).");
   if (cfg.mode !== "ask") {
     if (cfg.autoPlan === false && PLAN?.explicit !== true)
       s += "\nPLANNING: auto-planning is OFF for this user. Do NOT call `update_plan` and do not write a task list — just do the work directly and reply concisely.";
@@ -1446,10 +1645,11 @@ async function* streamChat(cfg, messages, tools, signal) {
   if (!res.ok) throw new ApiError(`HTTP ${res.status} ${await errText(res)}`);
   if (!res.body) throw new ApiError("empty response body");
 
-  // Misbehaving server: asked for JSON but got SSE anyway — fall back to the SSE parser.
+  // Route on what the server actually sent, not on what we asked for: some servers answer a
+  // stream request with one JSON body (and vice versa).
   const ct = (res.headers.get("content-type") || "").toLowerCase();
-  if (nonStream && ct.includes("text/event-stream")) { yield* sseChatEvents(res); return; }
-  if (nonStream) { yield* jsonChatEvents(res); return; }
+  if (ct.includes("text/event-stream")) { yield* sseChatEvents(res); return; }
+  if (ct.includes("application/json") || nonStream) { yield* jsonChatEvents(res); return; }
   yield* sseChatEvents(res);
 }
 
@@ -1511,10 +1711,16 @@ async function* sseChatEvents(res) {
 // Non-streaming mode ("stream": false): one JSON body with the complete message.
 async function* jsonChatEvents(res) {
   let j;
+  const text = await res.text();
   try {
-    j = JSON.parse(await res.text());
+    j = JSON.parse(text);
   } catch (e) {
-    throw new ApiError("invalid JSON response body (non-stream mode)");
+    // mislabelled SSE body → salvage it through the SSE parser
+    if (/^\s*(data:|:)/m.test(text)) {
+      yield* sseChatEvents(new Response(text, { headers: { "content-type": "text/event-stream" } }));
+      return;
+    }
+    throw new ApiError("invalid JSON response body: " + text.slice(0, 200));
   }
   if (j.error) throw new ApiError(typeof j.error === "string" ? j.error : (j.error.message || JSON.stringify(j.error)));
   const ch = j.choices?.[0] || {};
@@ -1623,27 +1829,55 @@ function runShell(cmd, timeoutSec, opts = {}, cfg = {}) {
     }
   }
 
+  // spawn (not exec) in its own process group: killing only `sh -c` would leave the real
+  // command (a hung server, `sleep`, a test runner) alive and holding the pipes, so a timeout
+  // or ctrl+c would block until it exited on its own.
   return new Promise(resolve => {
-    const child = exec(cmd, {
-      timeout: timeoutSec * 1000, maxBuffer: 8 * 1024 * 1024,
-      windowsHide: true, cwd: opts.cwd || process.cwd(),
-      ...(shell ? { shell } : {}),
-    }, (err, stdout, stderr) => {
-      currentChild = null;
-      if (err?.killed) return resolve([false,
-        `error: terminated after ${timeoutSec}s. If this is a server/watcher, rerun with background=true.`]);
+    let child;
+    try {
+      child = spawn(cmd, {
+        shell: shell || "/bin/sh", windowsHide: true, cwd: opts.cwd || process.cwd(),
+        detached: !IS_WIN, stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (e) { return resolve([false, `error: ${e.message}`]); }
+    const MAX = 8 * 1024 * 1024;
+    let stdout = "", stderr = "", size = 0, timedOut = false, interrupted = false, overflow = false, settled = false;
+    const killTree = () => {
+      if (IS_WIN) { try { spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" }); } catch {} }
+      else { try { process.kill(-child.pid, "SIGTERM"); } catch { try { child.kill("SIGTERM"); } catch {} } }
+      setTimeout(() => { if (!settled) { try { IS_WIN ? child.kill() : process.kill(-child.pid, "SIGKILL"); } catch {} } }, 2000).unref();
+    };
+    const grab = which => d => {
+      const s = String(d);
+      size += s.length;
+      if (which === "out") stdout += s; else stderr += s;
+      if (size > MAX && !overflow) { overflow = true; killTree(); }
+    };
+    child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+    child.stdout.on("data", grab("out")); child.stderr.on("data", grab("err"));
+    const timer = setTimeout(() => { timedOut = true; killTree(); }, Math.max(1, timeoutSec) * 1000);
+    const finish = (code, signal, spawnErr) => {
+      if (settled) return; settled = true;
+      clearTimeout(timer); currentChild = null;
+      if (spawnErr) return resolve([false, `error: ${spawnErr.message}`]);
       let text = stdout || "";
       if (stderr) text += "\n[stderr]\n" + stderr;
       if (!text.trim()) text = "[no output]";
-      if (err) {
-        const code = typeof err.code === "number" ? err.code : 1;
+      text = text.trim();
+      if (interrupted) return resolve([false, `error: interrupted by the user\n${truncate(text, 2000)}`]);
+      if (timedOut) return resolve([false,
+        `error: terminated after ${timeoutSec}s. If this is a server/watcher, rerun with background=true.\n${truncate(text, 4000)}`]);
+      if (overflow) return resolve([false, `error: output exceeded ${MAX} bytes — pipe it through head/tail/grep\n${truncate(text, 4000)}`]);
+      if (code !== 0) {
         recordCommand(cmd, false, text);
-        return resolve([false, (`[exit code ${code}]\n` + text).trim()]);
+        return resolve([false, `[exit code ${code ?? signal ?? 1}]\n${text}`]);
       }
       recordCommand(cmd, true, text);
-      resolve([true, text.trim()]);
-    });
-    currentChild = child;
+      resolve([true, text]);
+    };
+    child.on("error", e => finish(null, null, e));
+    child.on("close", (code, signal) => finish(code, signal));
+    currentChild = { pid: child.pid, kill: () => { interrupted = true; killTree(); } };
   });
 }
 function toolUpdatePlan(a, cfg) {
@@ -1657,29 +1891,42 @@ function toolRead(a, cfg) {
   if (many.length) {
     const cap = Math.max(2000, Math.floor((Number(cfg?.maxout) || 24000) / many.length));
     const parts = [];
-    let allOk = true;
+    let anyOk = false;
     for (const p of many.slice(0, 12)) {
-      const [ok, txt] = toolRead({ path: p }, cfg);
-      if (!ok) allOk = false;
-      parts.push(`===== ${p} ${ok ? "" : "(FAILED)"} =====\n${ok ? txt.slice(0, cap) : txt}`);
+      let ok, txt;
+      try { [ok, txt] = toolRead({ path: p }, cfg); }   // one missing file must not sink the batch
+      catch (e) { ok = false; txt = `error: could not read '${p}' (${e.code || e.message})`; }
+      if (ok) anyOk = true;
+      let body = txt;
+      if (ok && body.length > cap)
+        body = body.slice(0, cap) + `\n…[${body.length - cap} more chars not shown — read_file with path=${JSON.stringify(p)} alone (or start/end) for the rest]`;
+      parts.push(`===== ${p} ${ok ? "" : "(FAILED)"} =====\n${body}`);
     }
     if (many.length > 12) parts.push(`…and ${many.length - 12} more files not read (12 per call)`);
-    return [allOk, parts.join("\n\n")];
+    return [anyOk, parts.join("\n\n")];
   }
-  const p = resolveP(a.path, cfg);
   if (!String(a.path || "").trim()) return [false, "error: read_file needs `path` (one file) or `paths` (several)"];
+  const p = resolveP(a.path, cfg);
   if (isProtectedPath(p)) return [false, `error: could not read file '${a.path}' (no such file)`];
-  const fd = fs.openSync(p, "r");
+  let fd;
+  try { fd = fs.openSync(p, "r"); }
+  catch (e) { return [false, `error: could not read file '${a.path}' (${e.code || e.message})`]; }
   try {
-    const size = Math.min(fs.fstatSync(fd).size, 2_000_000);
+    const st = fs.fstatSync(fd);
+    if (st.isDirectory()) return [false, `error: '${a.path}' is a directory — use shell (ls/dir) to list it`];
+    const size = Math.min(st.size, 2_000_000);
     const b = Buffer.alloc(size);
     fs.readSync(fd, b, 0, size, 0);
+    if (b.subarray(0, Math.min(size, 8000)).includes(0))
+      return [false, `error: '${a.path}' looks like a binary file (${st.size} bytes) — not shown`];
     const lines = b.toString("utf8").split("\n");
     const total = lines.length;
     const s = Math.max(1, parseInt(a.start, 10) || 1);
-    const e = Math.min(total, parseInt(a.end, 10) || total);
+    let e = Math.min(total, parseInt(a.end, 10) || total);
+    if (e < s) e = Math.min(total, s);
     const seg = lines.slice(s - 1, e).join("\n");
-    const info = a.start || a.end ? `[${total} lines total, showed ${s}-${e}]\n` : "";
+    let info = a.start || a.end ? `[${total} lines total, showed ${s}-${e}]\n` : "";
+    if (st.size > size) info += `[file is ${st.size} bytes; only the first ${size} bytes were read]\n`;
     return [true, info + (seg || "[empty file]")];
   } finally { fs.closeSync(fd); }
 }
@@ -1690,22 +1937,38 @@ function toolStrReplace(a, cfg) {
   try { original = fs.readFileSync(p, "utf8"); }
   catch (e) { return [false, `error: could not read file '${p}' (${e.code || e.message})`]; }
   // silently map any dummy tokens back to the real values before matching/writing
-  const oldStr = restoreSecrets(String(a.old_str || a.old_string || ""));
-  const newStr = restoreSecrets(String(a.new_str || a.new_string || ""));
+  const oldStr = restoreSecrets(String(a.old_str ?? a.old_string ?? ""));
+  const newStr = restoreSecrets(String(a.new_str ?? a.new_string ?? ""));
   if (!oldStr) return [false, "error: old_str cannot be empty"];
-  if (oldStr.includes("chars truncated]…") || oldStr.includes("truncated")) {
-    return [false, "error: old_str contains truncation markers ('…[...chars truncated]…'). You cannot replace text you haven't read. Use `read_file` with `start`/`end` line numbers to read the exact lines, then try again."];
+  // Only the agent's own omission markers count — a file that merely contains the word
+  // "truncated" (log handling, tests, this very agent) must stay editable.
+  if (/…\[\d+ (chars|more chars)[^\]]*\]…?|\[\.\.\.middle omitted\.\.\.\]|…and \d+ more files not read/.test(oldStr)) {
+    return [false, "error: old_str contains an omission marker from a previous tool result ('…[N chars truncated]…'). You cannot replace text you haven't read. Use `read_file` with `start`/`end` line numbers to read the exact lines, then try again."];
   }
+  if (oldStr === newStr) return [false, "error: old_str and new_str are identical — nothing to change. If the file already looks right, move on."];
   const normOrig = original.replace(/\r\n/g, "\n");
   const normOld = oldStr.replace(/\r\n/g, "\n");
   const normNew = newStr.replace(/\r\n/g, "\n");
-  const occurrences = normOrig.split(normOld).length - 1;
-  if (occurrences === 0) return [false, `error: old_str not found in file. Ensure exact match (check indentation/whitespace).`];
-  if (occurrences > 1) return [false, `error: old_str matches ${occurrences} times. Include more context to make it unique.`];
-  const updated = normOrig.replace(normOld, normNew);
+  let idx = normOrig.indexOf(normOld), len = normOld.length, note = "";
+  if (idx >= 0) {
+    if (normOrig.indexOf(normOld, idx + 1) >= 0) {
+      const occurrences = normOrig.split(normOld).length - 1;
+      return [false, `error: old_str matches ${occurrences} times. Include more context to make it unique.`];
+    }
+  } else {
+    // second chance: trailing whitespace at line ends is the most common exact-match failure
+    const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const loose = new RegExp(normOld.split("\n").map(l => esc(l.replace(/[ \t]+$/, "")) + "[ \\t]*").join("\n"), "g");
+    const hits = [...normOrig.matchAll(loose)].filter(m => m[0].trim());
+    if (hits.length === 1) { idx = hits[0].index; len = hits[0][0].length; note = " (matched ignoring trailing whitespace)"; }
+    else if (hits.length > 1) return [false, `error: old_str matches ${hits.length} times. Include more context to make it unique.`];
+    else return [false, `error: old_str not found in file. Ensure exact match (check indentation/whitespace).`];
+  }
+  // splice by index — String.replace would interpret $&, $', $$ … in new_str and corrupt the file
+  const updated = normOrig.slice(0, idx) + normNew + normOrig.slice(idx + len);
   const finalContent = original.includes("\r\n") ? updated.replace(/\n/g, "\r\n") : updated;
   fs.writeFileSync(p, finalContent);
-  return [true, `replaced 1 occurrence in ${displayPath(p)}`];
+  return [true, `replaced 1 occurrence in ${displayPath(p)}${note}`];
 }
 function toolWrite(a, cfg) {
   const p = resolveP(a.path, cfg);
@@ -1739,28 +2002,58 @@ function toolForget(a) {
   if (mem.memories.length < before) { saveMemory(mem); return [true, `forgot memory ${a.memory_id}`]; }
   return [false, `memory ${a.memory_id} not found`];
 }
+// Tool arguments as the model sent them → a plain object. Invalid JSON is kept in `_raw`
+// (some servers hand over a bare command string as the arguments).
+function parseToolArgs(raw) {
+  const s = raw == null ? "" : String(raw);
+  if (!s.trim()) return {};
+  try {
+    const v = JSON.parse(s);
+    if (v && typeof v === "object" && !Array.isArray(v)) return v;
+    return { _raw: typeof v === "string" ? v : s };
+  } catch {
+    // strings some models forget to escape, wrapped in one more pair of braces/fence
+    const m = s.match(/^\s*```(?:json)?\s*([\s\S]*?)\s*```\s*$/);
+    if (m) return parseToolArgs(m[1]);
+    return { _raw: s };
+  }
+}
+function shellCommandOf(args) {
+  if (args.command != null && String(args.command).trim()) return [String(args.command), null];
+  if (typeof args.cmd === "string" && args.cmd.trim()) return [args.cmd, null];
+  const raw = String(args._raw || "").trim();
+  if (!raw) return [null, "error: shell needs a `command` string, e.g. {\"command\": \"ls -la\"}"];
+  if (/^[{[]/.test(raw)) return [null, "error: the tool call arguments were not valid JSON — resend the call as {\"command\": \"<your command>\"}"];
+  return [raw, null];
+}
 async function runTool(name, args, cfg) {
   try {
+    if (!args || typeof args !== "object") args = {};
     let out;
     if (mcpRegistry.has(name)) {
       const { client, realName } = mcpRegistry.get(name);
-      out = await client.callTool(realName, args, (cfg.timeout || 180) * 1000);
+      const mcpArgs = { ...args }; delete mcpArgs._raw;
+      out = await client.callTool(realName, mcpArgs, (cfg.timeout || 180) * 1000);
     }
     else if (name === "update_plan") out = toolUpdatePlan(args, cfg);
-    else if (name === "shell") out = await runShell(String(args.command || args._raw || ""), cfg.timeout || 180, { background: args.background, cwd: cfg.projectDir }, cfg);
+    else if (name === "shell") {
+      const [cmd, err] = shellCommandOf(args);
+      out = err ? [false, err] : await runShell(cmd, cfg.timeout || 180, { background: args.background === true || args.background === "true", cwd: cfg.projectDir }, cfg);
+    }
     else if (name === "read_file") out = toolRead(args, cfg);
     else if (name === "str_replace") out = toolStrReplace(args, cfg);
     else if (name === "write_file") out = toolWrite(args, cfg);
     else if (name === "remember") out = toolRemember(args, cfg);
     else if (name === "forget") out = toolForget(args);
-    else return [false, `unknown tool '${name}'`];
-    out[1] = maskSecrets(out[1], cfg);   // silent: real -> dummy before the model ever sees it
+    else return [false, `error: unknown tool '${name}'. Available: ${[...mcpRegistry.keys(), ...TOOLS.map(t => t.function.name)].join(", ")}`];
+    if (!Array.isArray(out)) out = [true, String(out ?? "")];
+    out[1] = maskSecrets(String(out[1] ?? ""), cfg);   // silent: real -> dummy before the model ever sees it
     if (PLAN) {
       PLAN.calls++;
       if (name === "shell") {
         const cmd = String(args.command || args._raw || "");
         noteShellRan(cmd, !!out[0]);
-        if (!READONLY.some(re => re.test(cmd.trim()))) PLAN.mutations++;
+        if (!isReadOnlyCommand(cmd)) PLAN.mutations++;
       } else if (name === "write_file" || name === "str_replace") {
         PLAN.mutations++;
       }
@@ -1773,14 +2066,40 @@ async function runTool(name, args, cfg) {
 
 // ------------------------------------------------------------------ context mgmt / stats
 const estTokens = h => Math.max(1, Math.floor(JSON.stringify(h).length / 4));
-function trimHistory(h, cfg) {
+// Drop h[i] together with the tool results that answer it (if it is an assistant tool-call message).
+function spliceExchange(h, i) {
+  const m = h[i];
+  h.splice(i, 1);
+  if (m?.role === "assistant" && Array.isArray(m.tool_calls))
+    while (i < h.length && h[i].role === "tool") h.splice(i, 1);
+}
+// Shrink the conversation to the context budget without losing the request being worked on:
+//   1. drop whole exchanges from earlier turns (oldest first),
+//   2. then shorten old tool outputs of the current turn to a stub,
+//   3. only then drop the oldest steps of the current turn — the user message itself stays.
+// `keep` is the user message that opened the current turn (kept by identity, so earlier
+// removals cannot shift it away).
+function trimHistory(h, cfg, keep = null) {
   const cap = Number(cfg.context) || 0;
   if (!cap) return;
   const budget = cap - 1024 - (Number(cfg.maxTokens) || 0);
-  while (h.length > 2 && estTokens(h) > budget) {
-    h.splice(1, 1);
-    while (h.length > 1 && h[1].role === "tool") h.splice(1, 1);
+  const over = () => estTokens(h) > budget;
+  if (!over()) return;
+  const keepIdx = () => (keep ? h.indexOf(keep) : -1);
+  let k;
+  while (over() && h.length > 2 && ((k = keepIdx()) < 0 ? h.length > 2 : k > 1)) spliceExchange(h, 1);
+  // never leave the transcript opening with an assistant/tool message (some servers reject that)
+  while (h.length > 2 && h[1].role !== "user" && h[1] !== keep) spliceExchange(h, 1);
+  if (!over()) return;
+  k = keepIdx();
+  if (k < 0) return;
+  const STUB = 600;
+  for (let i = k + 1; i < h.length - 2 && over(); i++) {
+    const m = h[i];
+    if (m.role === "tool" && typeof m.content === "string" && m.content.length > STUB)
+      m.content = m.content.slice(0, STUB) + `\n…[${m.content.length - STUB} chars trimmed to free context — re-read if needed]`;
   }
+  while (over() && h.length > k + 3) spliceExchange(h, k + 1);
 }
 const fmtK = n => {
   n = Number(n) || 0;
@@ -1804,23 +2123,56 @@ function showStats(cfg, history, usage) {
     : ` · ctx ${fmtK(ctxUsed)} (limit unknown — /set context <n>)`;
   console.log(dim("─ " + s + " ─"));
 }
-function sanitizeHistory(h) {
-  const openIds = new Set();
-  for (let i = 1; i < h.length; i++) {
+// Make the transcript something every OpenAI-compatible server accepts again:
+//   - every assistant tool_call has exactly one tool result right after it (an interrupted
+//     turn leaves calls without results → HTTP 400 on every later request),
+//   - no orphan tool results, no tool_calls with unparsable arguments,
+//   - the first message after the system prompt is a user message.
+// Returns the number of fixes applied.
+function repairHistory(h) {
+  let fixes = 0;
+  const out = [];
+  let i = 0;
+  if (h[0]?.role === "system") { out.push(h[0]); i = 1; }
+  while (i < h.length) {
     const m = h[i];
+    if (!m || typeof m !== "object" || !m.role) { i++; fixes++; continue; }
     if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
-      m.tool_calls = m.tool_calls.filter(tc => tryParse(tc.function?.arguments || "{}") !== undefined);
-      if (!m.tool_calls.length) { delete m.tool_calls; m.content = m.content || "(tool call omitted)"; openIds.clear(); }
-      else m.tool_calls.forEach(tc => openIds.add(tc.id));
-    } else if (m.role === "tool") {
-      if (!openIds.has(m.tool_call_id)) h[i] = null;
-      else openIds.delete(m.tool_call_id);
-    } else if (m.role === "assistant" || m.role === "user") {
-      openIds.clear();
+      const calls = m.tool_calls.filter(tc => tc?.id && tc.function?.name && tryParse(tc.function.arguments || "{}") !== undefined);
+      if (calls.length !== m.tool_calls.length) fixes++;
+      // collect the tool results that immediately follow
+      const results = new Map();
+      let j = i + 1;
+      while (j < h.length && h[j]?.role === "tool") { if (!results.has(h[j].tool_call_id)) results.set(h[j].tool_call_id, h[j]); else fixes++; j++; }
+      if (!calls.length) {
+        out.push({ role: "assistant", content: m.content || "(tool call omitted)" });
+        fixes++;
+      } else {
+        out.push({ ...m, tool_calls: calls });
+        for (const tc of calls) {
+          const r = results.get(tc.id);
+          if (r) out.push(r);
+          else { out.push({ role: "tool", tool_call_id: tc.id, content: "error: no result — the call was interrupted before it finished. Re-run it if still needed." }); fixes++; }
+        }
+      }
+      if (results.size > calls.length) fixes++;   // orphans for calls that were dropped
+      i = j;
+      continue;
     }
+    if (m.role === "tool") { i++; fixes++; continue; }   // orphan result
+    out.push(m);
+    i++;
   }
-  for (let i = h.length - 1; i >= 0; i--) if (h[i] === null) h.splice(i, 1);
+  // some servers reject a conversation that opens with an assistant/tool message
+  const first = out[0]?.role === "system" ? 1 : 0;
+  if (out.length > first && out[first].role !== "user") {
+    out.splice(first, 0, { role: "user", content: "(earlier messages were trimmed to fit the context window — continue from here)" });
+    fixes++;
+  }
+  if (fixes) { h.length = 0; h.push(...out); }
+  return fixes;
 }
+const sanitizeHistory = repairHistory;
 
 // ------------------------------------------------------------------ /compact
 async function compactHistory(cfg, history) {
@@ -2019,25 +2371,54 @@ function parseTextToolCalls(text) {
     }
   }
 
+  // Plain JSON tool calls: the whole reply (or a ```json fence, or Mistral's [TOOL_CALLS] [...])
+  // is {"name": "...", "arguments": {...}}. Only accepted for tools we actually offer, so a
+  // final answer that happens to quote JSON is never executed.
+  if (!calls.length) {
+    const known = new Set([...TOOLS.map(x => x.function.name), ...mcpRegistry.keys(), "bash", "cmd", "terminal", "console"]);
+    const candidates = [];
+    const bare = t.trim().replace(/^\[TOOL_CALLS\]\s*/i, "").replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
+    if (/^[{[]/.test(bare)) candidates.push(bare);
+    const fenceRe = /```(?:json)?\s*(\{[\s\S]*?\})\s*```/g;
+    let fm; while ((fm = fenceRe.exec(t))) candidates.push(fm[1]);
+    for (const c of candidates) {
+      let v; try { v = JSON.parse(c); } catch { continue; }
+      const list = Array.isArray(v) ? v : [v];
+      const ok = list.every(o => o && typeof o === "object" && typeof (o.name || o.tool || o.function?.name) === "string" && known.has(normalizeToolName(o.name || o.tool || o.function?.name)));
+      if (!ok || !list.length) continue;
+      for (const o of list) {
+        let args = o.arguments ?? o.parameters ?? o.input ?? o.args ?? o.function?.arguments ?? {};
+        if (typeof args === "string") { try { args = JSON.parse(args); } catch { args = { _raw: args }; } }
+        pushCall(o.name || o.tool || o.function?.name, args);
+      }
+      if (calls.length) break;
+    }
+  }
+
   return calls;
 }
 function stripToolMarkup(t) {
   return String(t || "")
     .replace(/\x3ctool\x3e[\s\S]*?(?:\x3c\/tool\x3e|$)/gi, "")
-    .replace(/\x3ctool\b[^\\x3e]*\x3e[\s\S]*?(?:\x3c\/tool\x3e|$)/gi, "")
+    .replace(/\x3ctool\b[^\x3e]*\x3e[\s\S]*?(?:\x3c\/tool\x3e|$)/gi, "")
     .replace(/\x3ctool_call\x3e[\s\S]*?(?:\x3c\/tool_call\x3e|$)/gi, "")
     .replace(/\x3cfunction=[\s\S]*?(?:\x3c\/function\x3e|$)/gi, "")
     .replace(/\x3c\/?(?:tool|tool_call|bash|shell|cmd|terminal|function|command|path|start|end|old_str|new_str|content|input|arguments|parameter)\b[^\x3e]*\x3e/gi, "")
+    .replace(/^\[TOOL_CALLS\]\s*[\[{][\s\S]*$/i, "")
+    .replace(/```(?:json)?\s*\{\s*"(?:name|tool)"\s*:[\s\S]*?\}\s*```/g, "")
+    .replace(/^\s*\{\s*"(?:name|tool)"\s*:[\s\S]*\}\s*$/, "")
     .trim();
 }
 
 // ------------------------------------------------------------------ agent loop
+let _callSeq = 0;   // session-unique ids for tool calls the server did not label
 async function agentTurn(cfg, history, keys) {
-  if (cfg.tools) await ensureMcp();
-  let tools = cfg.tools ? allTools() : [];
+  if (cfg.tools && !cfg._toolsUnsupported) await ensureMcp();
+  let tools = cfg.tools && !cfg._toolsUnsupported ? allTools() : [];
   if (cfg.mode === "ask") tools = [];
   else if (cfg.mode === "plan") tools = tools.filter(t => ["read_file", "shell", "update_plan"].includes(t.function.name) || mcpRegistry.has(t.function.name));
-  const lastUserMsg = [...history].reverse().find(m => m.role === "user")?.content || "";
+  const turnMsg = [...history].reverse().find(m => m.role === "user") || null;   // the request being worked on
+  const lastUserMsg = turnMsg?.content || "";
   // Auto-planning: derive a goal from the prompt and let the model decompose it into tasks.
   // Switched off with /set autoplan off — but an explicit `/plan goal <text>` still opts in,
   // so turning auto off does not lock you out of planning when you want it.
@@ -2055,12 +2436,22 @@ async function agentTurn(cfg, history, keys) {
     console.log(dim("⌾ goal: ") + dim(plan.goal));
     plan.fresh = false; plan.announced = true;
   }
+  // an earlier interrupted turn may have left tool calls without results → fix before calling out
+  if (repairHistory(history)) console.log(dim("· repaired an inconsistent conversation history"));
 
   const limit = Number(cfg.maxSteps) || 0;
   let step = 0;
   let failStreak = 0;
-  const recentContentSigs = [];  // track assistant text output signatures
-  const recentToolSigs = [];     // track tool call signatures
+  const responseSigs = [];   // whole responses (text + tool calls), for verbatim resends
+  const callLog = [];        // executed tool calls: { sig, res, mut }, for result-aware loop detection
+  const stopWithLoop = (why, what) => {
+    history.push({ role: "assistant", content:
+      `I detected a repetition loop in my ${what} (${why}) and stopped. ` +
+      "I appear to be repeating the same work without making progress. " +
+      "Please rephrase your request, or tell me what specific outcome you need." });
+    console.log(red(`! repetition loop detected in ${what} (${why}) — stopping`));
+    if (planOpen()) printPlan();
+  };
   for (;;) {
     step++;
     if (plan) plan.rounds = step;   // one model round trip per step
@@ -2074,7 +2465,7 @@ async function agentTurn(cfg, history, keys) {
     }
 
     refreshSystem();               // live goal + task state on every round trip
-    trimHistory(history, cfg);
+    trimHistory(history, cfg, turnMsg);
     const md = new MDStream();
     let shownThink = false, shownText = false, result = null;
     const ac = new AbortController();
@@ -2110,34 +2501,40 @@ async function agentTurn(cfg, history, keys) {
           if (e?.name === "AbortError") { process.stdout.write(dim("· interrupted\n")); return; }
           const msg = String(e?.message || e);
           const gotOutput = shownThink || shownText;
-          if (!gotOutput && attempts < 3) {
+          if (!gotOutput && attempts < 4) {
             if (/stream_options|include_usage/i.test(msg)) {
               cfg._noStreamOpts = true;
               process.stdout.write(yellow("! usage reporting unsupported — retrying without it\n"));
               continue;
             }
             if (RETRYABLE(msg)) {
-              process.stdout.write(yellow(`! ${msg} — retry ${attempts}/2 in ${attempts}s…\n`));
+              process.stdout.write(yellow(`! ${msg} — retry ${attempts}/3 in ${attempts}s…\n`));
               await sleep(1000 * attempts);
               continue;
             }
-            if (/(context|token|length)/i.test(msg) &&
-                /(exceed|too (long|many|large)|maximum|limit|reduce|at most)/i.test(msg)) {
+            if (/(context|token|length|prompt)/i.test(msg) &&
+                /(exceed|too (long|many|large)|maximum|limit|reduce|at most|overflow)/i.test(msg)) {
+              // shrink for THIS session only — a permanently lowered context setting would keep
+              // the agent crippled long after one oversized tool result
               const cur = Number(cfg.context) || estTokens(history);
-              cfg.context = Math.max(2048, Math.floor(cur * 0.6));
-              trimHistory(history, cfg);
-              saveCfg(cfg);
-              process.stdout.write(yellow(`! context overflow — trimmed history (context now ${cfg.context}); you can also run /compact\n`));
+              cfg.context = Math.max(2048, Math.floor(Math.min(cur, estTokens(history)) * 0.6));
+              trimHistory(history, cfg, turnMsg);
+              process.stdout.write(yellow(`! context overflow — trimmed history (working context now ${cfg.context} for this session); /set context <n> to fix it, /compact to summarize\n`));
               continue;
             }
-            if (/invalid tool call|tool call arguments|malformed tool/i.test(msg)) {
-              sanitizeHistory(history);
-              process.stdout.write(yellow("! repaired malformed tool-call history — retrying\n"));
-              continue;
+            // history-shape complaints: the transcript can be repaired and resent
+            if (/tool_call_id|tool_calls?.*(must|should|need)|did not have response|response messages|invalid tool call|tool call arguments|malformed tool|role ['"]?tool|messages with role/i.test(msg)) {
+              const fixed = repairHistory(history);
+              if (fixed || attempts === 1) {
+                process.stdout.write(yellow("! repaired malformed tool-call history — retrying\n"));
+                continue;
+              }
             }
-            if (tools.length && step === 1 && /tool|function/i.test(msg)) {
-              process.stdout.write(yellow("! tools rejected by endpoint — retrying as plain chat\n"));
-              tools = []; cfg.tools = false;
+            // the endpoint does not do function calling at all → plain chat for this session
+            if (tools.length && step === 1 && /tool|function/i.test(msg) &&
+                /not support|unsupported|unknown|unrecognized|unexpected|invalid|not allowed|does not|doesn't|cannot|extra (field|input)|no such/i.test(msg)) {
+              process.stdout.write(yellow("! tools rejected by endpoint — retrying as plain chat for this session (/set tools on to retry native tools)\n"));
+              tools = []; cfg._toolsUnsupported = true;
               continue;
             }
           }
@@ -2146,11 +2543,11 @@ async function agentTurn(cfg, history, keys) {
       }
     } finally { keys.onCtrlC = null; spin.stop(); }
 
-   if (!result) throw new ApiError("empty response from model");
+    if (!result) throw new ApiError("empty response from model");
     if (result.finish === "length") console.log(yellow("! response truncated (token limit)"));
 
     let tcs = result.toolCalls || [];
-    // FIX: model printed tool calls as XML text (server without native tools)
+    // FIX: model printed tool calls as XML/JSON text (server without native tools)
     if (!tcs.length && result.content) {
       const xt = parseTextToolCalls(result.content);
       if (xt.length) {
@@ -2158,10 +2555,10 @@ async function agentTurn(cfg, history, keys) {
         result.content = stripToolMarkup(result.content);
       }
     }
+    if (cfg.mode === "ask" && tcs.length) tcs = [];   // ask mode never executes anything
     if (!tcs.length) { // final message → done (1 round trip), unless the plan says otherwise
-      const nudge = plan ? planGate() : null;
+      const nudge = plan ? planGate(cfg) : null;
       if (nudge) {
-        plan.nudges++;
         history.push({ role: "assistant", content: result.content || "" });
         history.push({ role: "user", content: nudge });
         console.log(yellow(`! plan incomplete — following up (${plan.nudges}/${MAX_PLAN_NUDGES})`));
@@ -2174,93 +2571,80 @@ async function agentTurn(cfg, history, keys) {
       return;
     }
 
-    // --- loop detection: check if model is repeating itself ---
-    // Check content repetition
-    const contentSig = contentSignature(result.content);
-    if (contentSig) recentContentSigs.push(contentSig);
-    if (recentContentSigs.length > LOOP_WINDOW * 2) recentContentSigs.splice(0, recentContentSigs.length - LOOP_WINDOW * 2);
-    const contentLoop = detectLoop(recentContentSigs);
-    if (contentLoop) {
-      history.push({ role: "assistant", content:
-        `I detected a repetition loop in my own output (${contentLoop}) and stopped. ` +
-        "I appear to be generating the same response repeatedly without making progress. " +
-        "Please rephrase your request or break it into smaller steps." });
-      console.log(red(`! repetition loop detected in model output (${contentLoop}) — stopping`));
-      return;
-    }
-
-    // Check tool call repetition
+    // --- loop detection, part 1: the exact same response (text + calls) sent again and again ---
     const toolSigs = tcs.map(t => toolCallSignature(t.name, t.arguments));
-    for (const sig of toolSigs) recentToolSigs.push(sig);
-    if (recentToolSigs.length > LOOP_WINDOW * 3) recentToolSigs.splice(0, recentToolSigs.length - LOOP_WINDOW * 3);
-    const toolLoop = detectLoop(recentToolSigs);
-    if (toolLoop) {
-      history.push({ role: "assistant", content:
-        `I detected a repetition loop in my tool calls (${toolLoop}) and stopped. ` +
-        "I appear to be making the same tool calls repeatedly without making progress. " +
-        "Please rephrase your request, or tell me what specific outcome you need." });
-      console.log(red(`! repetition loop detected in tool calls (${toolLoop}) — stopping`));
-      return;
-    }
+    responseSigs.push(contentSignature(result.content) + "\u0000" + toolSigs.join("\u0001"));
+    if (responseSigs.length > LOOP_WINDOW) responseSigs.splice(0, responseSigs.length - LOOP_WINDOW);
+    const respLoop = detectResponseLoop(responseSigs);
+    if (respLoop) { stopWithLoop(respLoop, "output"); return; }
 
     const entries = tcs.map((t, i) => ({
-      id: t.id || `call_${step}_${i}`,
+      id: t.id || `call_${++_callSeq}_${step}_${i}`,
       type: "function",
       function: { name: t.name || "", arguments: t.arguments || "{}" },
     }));
     history.push({ role: "assistant", content: result.content || null, tool_calls: entries });
 
-    for (const e of entries) {
-      let args; try { args = JSON.parse(e.function.arguments); } catch { args = { _raw: e.function.arguments }; }
+    // Every tool_call MUST get a tool result, even when we bail out half-way (ctrl+c, loop stop,
+    // failure limit) — otherwise the next request is rejected by the server.
+    const answered = new Set();
+    const answer = (id, content) => { answered.add(id); history.push({ role: "tool", tool_call_id: id, content }); };
+    const answerRest = (why) => { for (const e of entries) if (!answered.has(e.id)) answer(e.id, `error: not executed — ${why}`); };
+
+    for (let ei = 0; ei < entries.length; ei++) {
+      const e = entries[ei];
+      const args = parseToolArgs(e.function.arguments);
+      const sig = toolSigs[ei];
       console.log(yellow("⚙ ") + bold(e.function.name) + dim(" " + fmtCall(e.function.name, args)));
 
+      let ok = null, res = null;
       if (cfg.intercept) {
         const verdict = classifyTool(e.function.name, args);
         if (verdict === "block") {
           console.log("  " + red("⛔ blocked by safety policy"));
-          history.push({ role: "tool", tool_call_id: e.id,
-                         content: "error: blocked by safety policy (dangerous command). Try a safer alternative." });
-          failStreak++;
-        } else {
-          let run = true;
-          if (verdict === "ask" && !cfg.autoYes) {
-            const ans = await confirmTool(e.function.name, args, keys);
-            if (ans === "always") cfg.autoYes = true;
-            else if (ans === "no") {
-              run = false;
-              console.log("  " + red("✗ rejected by user"));
-              history.push({ role: "tool", tool_call_id: e.id,
-                             content: "error: rejected by user — do NOT retry this exact command" });
-            }
-          }
-          if (run) {
-            keys.onCtrlC = () => { ac.abort(); currentChild?.kill(); };
-            const [ok, res] = await runTool(e.function.name, args, cfg);
-            keys.onCtrlC = null;
-            if (ac.signal.aborted) { console.log(dim("· interrupted")); return; }
-            const first = (res.trim().split("\n")[0] || "").slice(0, 140);
-            const more = res.length > 140 ? dim(` …${res.length}ch`) : "";
-            console.log(`  ${ok ? green("✓") : red("✗")} ${dim(first)}${more}`);
-            if (ok) failStreak = 0; else failStreak++;
-            history.push({ role: "tool", tool_call_id: e.id, content: truncate(res, cfg.maxout) });
+          ok = false; res = "error: blocked by safety policy (dangerous command). Try a safer alternative.";
+        } else if (verdict === "ask" && !cfg.autoYes) {
+          const ans = await confirmTool(e.function.name, args, keys);
+          if (ans === "always") cfg.autoYes = true;
+          else if (ans === "no") {
+            console.log("  " + red("✗ rejected by user"));
+            ok = false; res = "error: rejected by user — do NOT retry this exact command";
           }
         }
-      } else {
-        keys.onCtrlC = () => { ac.abort(); currentChild?.kill(); };
-        const [ok, res] = await runTool(e.function.name, args, cfg);
+      }
+      if (ok === null) {
+        keys.onCtrlC = () => { ac.abort(); try { currentChild?.kill(); } catch {} };
+        [ok, res] = await runTool(e.function.name, args, cfg);
         keys.onCtrlC = null;
-        if (ac.signal.aborted) { console.log(dim("· interrupted")); return; }
+        if (ac.signal.aborted) {
+          answer(e.id, /^error: interrupted/.test(res || "") ? truncate(res, 2000) : `error: interrupted by the user${res ? "\n" + truncate(res, 2000) : ""}`);
+          answerRest("interrupted by the user");
+          console.log(dim("· interrupted"));
+          return;
+        }
         const first = (res.trim().split("\n")[0] || "").slice(0, 140);
         const more = res.length > 140 ? dim(` …${res.length}ch`) : "";
         console.log(`  ${ok ? green("✓") : red("✗")} ${dim(first)}${more}`);
-        if (ok) failStreak = 0; else failStreak++;
-        history.push({ role: "tool", tool_call_id: e.id, content: truncate(res, cfg.maxout) });
       }
+      if (ok) failStreak = 0; else failStreak++;
+      answer(e.id, truncate(res, cfg.maxout));
 
       // keep the user's checklist in view — after a plan update, or when a check cleared a flag
       if (e.function.name === "update_plan" || plan?.dirty) { printPlan(); if (plan) plan.dirty = false; }
 
+      // --- loop detection, part 2: same call → same answer, nothing changed in between ---
+      callLog.push({ sig, res: resultSignature(res), mut: ok && isMutatingCall(e.function.name, args),
+                     wait: e.function.name === "shell" && /\b(sleep|timeout|wait|ping|watch|until|poll)\b/i.test(String(args.command || args._raw || "")) });
+      if (callLog.length > LOOP_WINDOW) callLog.splice(0, callLog.length - LOOP_WINDOW);
+      const toolLoop = detectToolLoop(callLog);
+      if (toolLoop) {
+        answerRest("stopped: repetition loop detected");
+        stopWithLoop(toolLoop, "tool calls");
+        return;
+      }
+
       if (failStreak >= MAX_FAIL_STREAK) {
+        answerRest(`stopped after ${MAX_FAIL_STREAK} consecutive failures`);
         history.push({ role: "assistant", content:
           `I hit ${MAX_FAIL_STREAK} consecutive failures and stopped to avoid making things worse. ` +
           "Here's where I'm stuck — please tell me how you'd like to proceed." });
@@ -2781,7 +3165,7 @@ async function handleCommand(line, cfg, history, keys) {
         else if (k === "intercept") cfg.intercept = ["on","true","1"].includes(v);
         else if (k === "tools") {
           const t = (v || "").toLowerCase();
-          if (["on","true","1","enable","enabled"].includes(t)) cfg.tools = true;
+          if (["on","true","1","enable","enabled"].includes(t)) { cfg.tools = true; delete cfg._toolsUnsupported; }
           else if (["off","false","0","disable","disabled"].includes(t)) cfg.tools = false;
           else { console.log(dim("usage: /set tools <on|off>")); return true; }
         }
@@ -2868,7 +3252,10 @@ function parseArgs(argv) {
       case "--list": a.list = true; break;
       case "--save": a.save = true; break;
       case "-h": case "--help": a.help = true; break;
-      default: if (!a.prompt) a.prompt = x;
+      default:
+        // a mistyped flag must not silently become the prompt
+        if (/^--?[a-z]/i.test(x) && x !== "-") { console.error(yellow(`! unknown option '${x}' ignored (see --help)`)); break; }
+        if (!a.prompt) a.prompt = x;
     }
   }
   return a;
@@ -2969,12 +3356,31 @@ async function main() {
     try {
       await agentTurn(cfg, history, keys);
     } catch (e) {
-      history.length = snap;
+      // Nothing happened yet → drop the request so it can simply be retried. Tools already ran →
+      // keep that context (files may have changed) and just make the transcript consistent.
+      const progressed = history.slice(snap + 1).some(m => m.role === "tool");
+      if (!progressed) history.length = snap;
+      else {
+        repairHistory(history);
+        history.push({ role: "assistant", content: `(stopped by an error: ${String(e.message).slice(0, 300)})` });
+      }
       console.error(red("✗ " + e.message));
       if (/context|token/i.test(e.message)) console.log(dim("  hint: /set context <n> or /compact to free context"));
+      if (progressed) console.log(dim("  the work done so far is kept in the conversation — say 'continue' to resume"));
     }
   }
   console.log(dim("bye"));
 }
 
-main().catch(e => { console.error(red("fatal: " + (e.stack || e.message))); process.exit(1); });
+// Pure helpers exported for the unit tests (test/*.test.mjs import this file with
+// AI_AGENT_NO_MAIN=1 so the REPL does not start).
+export {
+  canonicalJson, toolCallSignature, resultSignature, contentSignature, detectToolLoop, detectResponseLoop,
+  repairHistory, trimHistory, estTokens, maskSecrets, restoreSecrets, parseTextToolCalls, stripToolMarkup,
+  parseToolArgs, shellCommandOf, isReadOnlyCommand, checkCommandPolicy, classifyTool, mergeToolCallChunk,
+  repairToolCalls, toolStrReplace, toolRead, toolWrite, applyPlanUpdate, planGate, startPlanTurn, resetPlan,
+  newPlan, verifySeen, normalizeBase, seedGoal, parseArgs, runShell,
+};
+
+if (!process.env.AI_AGENT_NO_MAIN)
+  main().catch(e => { console.error(red("fatal: " + (e.stack || e.message))); process.exit(1); });
