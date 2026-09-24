@@ -15,8 +15,11 @@ import { startMockLLM } from "./mock-llm.mjs";
 const AGENT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "agent.mjs");
 
 // The agent's non-TTY entry point reads the prompt from stdin (piped one-shot mode).
-function runAgent({ url, prompt, dir, home, extraArgs = [], env = {} }) {
+function runAgent({ url, prompt, dir, home, mock, extraArgs = [], env = {} }) {
   return new Promise((resolve) => {
+    // os.homedir() ignores HOME on POSIX, so pin AITERM_HOME (the agent's data-dir
+    // override) to guarantee a stale ~/.aiterm/config.json can't leak its apiUrl
+    // into the test and send requests to the wrong endpoint.
     const child = spawn(process.execPath, [
       AGENT,
       "--url", url,
@@ -26,14 +29,15 @@ function runAgent({ url, prompt, dir, home, extraArgs = [], env = {} }) {
       "--context", "8000",
       ...extraArgs,
     ], {
-      env: { ...process.env, HOME: home, NO_COLOR: "1", ...env },
+      env: { ...process.env, HOME: home, USERPROFILE: home, AITERM_HOME: home, NO_COLOR: "1", ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
 
     let out = "";
     child.stdout.on("data", c => (out += c));
     child.stderr.on("data", c => (out += c));
-    child.on("close", code => resolve({ code, out }));
+    // mock.requests is exposed to the caller so tests can assert on the exact payloads sent
+    child.on("close", code => resolve({ code, out, requests: mock ? mock.requests : undefined }));
     child.stdin.write(prompt);
     child.stdin.end();
   });
@@ -51,14 +55,14 @@ test("default mode sends stream:true and renders the streamed reply", async () =
 
   const mock = await startMockLLM([{ content: "Hello from streaming mode" }]);
   try {
-    const { code, out } = await runAgent({
-      url: mock.url, prompt: "say hi", dir, home,
+    const { code, out, requests } = await runAgent({
+      url: mock.url, mock, prompt: "say hi", dir, home,
     });
     assert.equal(code, 0, out);
     assert.match(out, /Hello from streaming mode/);
-    assert.equal(mock.requests.length >= 1, true);
-    assert.equal(mock.requests[0].stream, true);
-    assert.deepEqual(mock.requests[0].stream_options, { include_usage: true });
+    assert.equal(requests.length >= 1, true);
+    assert.equal(requests[0].stream, true);
+    assert.deepEqual(requests[0].stream_options, { include_usage: true });
   } finally { await mock.close(); }
 });
 
@@ -69,17 +73,17 @@ test("--stream off sends \"stream\": false and handles the single JSON reply", a
 
   const mock = await startMockLLM([{ content: "Connected" }]);
   try {
-    const { code, out } = await runAgent({
-      url: mock.url,
+    const { code, out, requests } = await runAgent({
+      url: mock.url, mock,
       prompt: "Hello! Confirm connectivity with one word.",
       dir, home,
       extraArgs: ["--stream", "off"],
     });
     assert.equal(code, 0, out);
     assert.match(out, /Connected/);
-    assert.equal(mock.requests.length >= 1, true);
-    assert.equal(mock.requests[0].stream, false);
-    assert.equal(mock.requests[0].stream_options, undefined);
+    assert.equal(requests.length >= 1, true);
+    assert.equal(requests[0].stream, false);
+    assert.equal(requests[0].stream_options, undefined);
     // usage from the JSON body is still reported
     assert.match(out, /↑100\s*↓20/);
   } finally { await mock.close(); }
@@ -95,18 +99,18 @@ test("--no-stream drives the full tool loop (tool call → tool result → final
     { content: "wrote hello.txt" },
   ]);
   try {
-    const { code, out } = await runAgent({
-      url: mock.url, prompt: "write hello.txt", dir, home,
+    const { code, out, requests } = await runAgent({
+      url: mock.url, mock, prompt: "write hello.txt", dir, home,
       extraArgs: ["--no-stream"],
     });
     assert.equal(code, 0, out);
     assert.match(out, /write_file/);          // tool call shown
     assert.match(out, /wrote hello\.txt/);    // final reply
     assert.equal(fs.readFileSync(path.join(dir, "hello.txt"), "utf8"), "hi\n");
-    assert.equal(mock.requests[0].stream, false);
-    assert.equal(mock.requests[1].stream, false);
+    assert.equal(requests[0].stream, false);
+    assert.equal(requests[1].stream, false);
     // the tool result must have been sent back in the follow-up non-stream request
-    const toolMsg = mock.requests[1].messages.find(m => m.role === "tool");
+    const toolMsg = requests[1].messages.find(m => m.role === "tool");
     assert.match(String(toolMsg?.content), /hello\.txt/);
   } finally { await mock.close(); }
 });
@@ -118,13 +122,13 @@ test("AI_STREAM=off env var enables non-streaming mode", async () => {
 
   const mock = await startMockLLM([{ content: "env says no streaming" }]);
   try {
-    const { code, out } = await runAgent({
-      url: mock.url, prompt: "hi", dir, home,
+    const { code, out, requests } = await runAgent({
+      url: mock.url, mock, prompt: "hi", dir, home,
       env: { AI_STREAM: "off" },
     });
     assert.equal(code, 0, out);
     assert.match(out, /env says no streaming/);
-    assert.equal(mock.requests[0].stream, false);
+    assert.equal(requests[0].stream, false);
   } finally { await mock.close(); }
 });
 
@@ -157,7 +161,7 @@ test("server that replies with SSE despite stream:false is still parsed (fallbac
   const url = `http://127.0.0.1:${server.address().port}/v1`;
 
   try {
-    const { code, out } = await runAgent({
+    const { code, out, requests } = await runAgent({
       url, prompt: "hi", dir, home, extraArgs: ["--stream", "off"],
     });
     assert.equal(code, 0, out);
