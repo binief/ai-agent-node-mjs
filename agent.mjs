@@ -3,21 +3,6 @@
  * ai-agent.mjs — minimal, fully-working, self-learning terminal AI agent.
  * Node >= 18, ZERO dependencies (stdlib only).
  *
- * v2.12.0 — v2.11.0 + configurable streaming:
- *   - `/set stream <on|off>` (default on) — also `--stream on|off` / `--no-stream` and
- *     env AI_STREAM. When off, the model endpoint is called with `"stream": false` and the
- *     single JSON reply is parsed natively (content, reasoning, tool_calls, usage), so
- *     OpenAI-compatible servers that don't do SSE (e.g. vLLM/LM Studio at localhost:8000)
- *     work with a plain curl-style request.
- *   - In stream mode nothing changes, and a server that replies with JSON anyway is still
- *     handled by the existing fallback.
- *
- * v2.13.0 — removed the goal → tasks → follow-up planning layer entirely.
- *   The harness is back to a simple one-request → one-agent-turn flow: the model works
- *   with tools until it replies with a final message, then the turn ends. No update_plan
- *   tool, no completion gate, no synthetic "NOT DONE YET" user messages, no task
- *   checklist injected into the system prompt (these were the source of the loops).
- *
  * v2.10.0 — v2.9.0 + loop detection:
  *   - Detects when the model repeats the same text output or tool calls
  *   - Catches exact repeats, cycling patterns (A-B-A-B), and dominated sequences
@@ -58,13 +43,10 @@ import { exec, spawn } from "node:child_process";
 import process from "node:process";
 import { EventSource } from "eventsource";
 
-const VERSION = "2.13.0";
+const VERSION = "2.10.0";
 
 // ------------------------------------------------------------------ data folder
-// AITERM_HOME lets tests (and power users) relocate the whole data folder.
-// os.homedir() ignores HOME on POSIX, so pinning env.HOME in a child process is
-// not enough to isolate ~/.aiterm — this explicit override is the reliable way.
-const DATA_DIR = path.join(process.env.AITERM_HOME || os.homedir(), ".aiterm");
+const DATA_DIR = path.join(os.homedir(), ".aiterm");
 const CFG_PATH = path.join(DATA_DIR, "config.json");
 const MCP_PATH = path.join(DATA_DIR, "mcp.json");
 const MEM_PATH = path.join(DATA_DIR, "memory.json");
@@ -118,17 +100,16 @@ const ALIASES = {
 const SYS_PROMPT =
   "You are an expert autonomous software-engineering agent with deep knowledge across programming languages and frameworks, operating in the user's project via a terminal.\n" +
   "The user gives you a task; work autonomously, using tools repeatedly until it is fully complete. Do not give up unless you are certain it cannot be done with the available tools.\n" +
-  "Do not stop to ask permission or ask clarifying questions mid-task: pick the most reasonable interpretation, state the assumption in one line, and keep going.\n" +
   "\n" +
-  "WORK METHOD — understand, execute, prove:\n" +
-  "1. UNDERSTAND FIRST: infer the project type (language, framework, libraries) from the request and files. Explore before changing. Never assume — gather context, then act.\n" +
-  "2. MINIMISE ROUND TRIPS: issue every independent tool call in ONE response — read all the files you need together (or pass `paths` to read_file), run exploration commands chained with && , and never make a call whose result you could have obtained in the same batch. Do not re-read a file you just wrote, and do not re-run a command that already succeeded.\n" +
-  "3. GATHER CONTEXT EFFICIENTLY: prefer reading large meaningful chunks over many small reads. Use `shell` (grep/find/rg/dir) to locate code instead of guessing.\n" +
+  "WORK METHOD:\n" +
+  "1. UNDERSTAND FIRST: infer the project type (language, framework, libraries) from the task and files. Explore before changing. Never assume — gather context, then act.\n" +
+  "2. DECOMPOSE: break complex tasks into small concepts; identify which files each one needs.\n" +
+  "3. GATHER CONTEXT EFFICIENTLY: prefer reading large meaningful chunks over many small reads. Use `shell` (grep/find/rg/dir) to locate code instead of guessing. Batch independent tool calls into one response.\n" +
   "4. EDIT CORRECTLY: use `str_replace` for targeted edits (exact match); use `write_file` only for new files or full rewrites (full content, never placeholders). Follow existing conventions — indentation, style, naming, framework versions.\n" +
   "5. USE ESTABLISHED LIBRARIES: if a well-known package solves a problem, install it properly (npm/pip/etc.) rather than reimplementing it.\n" +
   "6. OMITTED CONTENT: if context shows an omission marker (e.g. '...lines omitted...'), read the real content before editing; never pass the marker into an edit.\n" +
-  "7. VERIFY: after making changes, run the relevant build/tests/checks and confirm they actually pass — never claim success on intent. If a check fails, fix it in the same turn.\n" +
-  "8. ERROR LIMIT: if the same fix fails repeatedly, stop and explain the blocker + options to the user instead of looping.\n" +
+  "7. VALIDATE: after changes, run build/tests/linters via `shell` to confirm. Verify errors are actually fixed.\n" +
+  "8. ERROR LIMIT: if the same fix fails repeatedly, STOP and explain the blocker + options to the user instead of looping.\n" +
   "9. ITERATE WITHOUT REPEATING: after each tool call, continue from where you left off. NEVER repeat the same tool call with the same arguments. NEVER output the same text twice in a row. If you notice you're going in circles, STOP and explain what's happening.\n" +
   "\n" +
   "SHELLS: use cmd-style commands; PowerShell is blocked. Use background=true for dev servers/watchers.\n" +
@@ -136,7 +117,7 @@ const SYS_PROMPT =
   "MEMORY: use `remember` to persist lessons/preferences/workarounds; check recalled memories for past solutions to similar problems.\n" +
   "SAFETY: avoid destructive commands unless clearly required; never hardcode secrets; refuse harmful/illegal requests briefly.\n" +
   "TERSE: no preamble, no restating, no apologies.\n" +
-  "FINISH: when the request is complete, reply with a 1-3 line summary of what changed and how it was validated.\n"+
+  "FINISH: when done, reply with a 1-3 line summary of what changed and how it was validated.\n"+
   "TOOLS: tool calls should be in json format not xml.";
 
 const MAX_FAIL_STREAK = 3;
@@ -199,7 +180,7 @@ function detectLoop(recentSigs) {
 const TOOLS = [
   { type: "function", function: {
       name: "shell",
-      description: "Run a shell command; returns exit code + stdout/stderr. background=true for long-running processes (dev servers, watchers) so it returns immediately. Combine independent commands with && or ; to save round trips. Note: PowerShell is blocked; use cmd.",
+      description: "Run a shell command; returns exit code + stdout/stderr. background=true for long-running processes (dev servers, watchers) so it returns immediately. Note: PowerShell is blocked; use cmd.",
       parameters: { type: "object",
         properties: {
           command: { type: "string" },
@@ -208,14 +189,10 @@ const TOOLS = [
         required: ["command"] } } },
   { type: "function", function: {
       name: "read_file",
-      description: "Read a text file (path relative to project folder), optionally a line range. Prefer large meaningful chunks. Pass `paths` (array) instead of `path` to read several files in ONE call.",
+      description: "Read a text file (path relative to project folder), optionally a line range. Prefer large meaningful chunks.",
       parameters: { type: "object",
-        properties: {
-          path: { type: "string", description: "Single file to read." },
-          paths: { type: "array", items: { type: "string" }, description: "Several files at once — cheaper than one call per file." },
-          start: { type: "integer", description: "First line (1-based); only applies to `path`." },
-          end: { type: "integer", description: "Last line inclusive; only applies to `path`." }
-        } } } },
+        properties: { path: { type: "string" }, start: { type: "integer" }, end: { type: "integer" } },
+        required: ["path"] } } },
   { type: "function", function: {
       name: "str_replace",
       description: "Replace an exact, contiguous block of text in a file for targeted edits. `old_str` must match exactly (including whitespace).",
@@ -262,9 +239,8 @@ commands
   /set max_steps <n>      tool-step cap (0 = unlimited; default)
   /set intercept <on|off> approval gate before mutating tools run
   /set tools <on|off>     enable/disable native function calling
-  /set stream <on|off>    streaming replies (on = SSE chunks; off = "stream": false, single JSON)
   /set system <prompt>    replace system prompt
-  /mode <ask|code>        agent mode (ask=chat only, code=full auto)
+  /mode <ask|plan|code>   agent mode (ask=chat, plan=read-only plan, code=full auto)
   /redact <on|off>        toggle silent secret redaction (default: on)
   /compact                summarize & shrink history (use when context is getting full)
   /block <regex>  /unblock <regex>  /blocked     manage command blocklist
@@ -291,12 +267,11 @@ usage: node ai-agent.mjs [options] ["one-shot prompt"]
   --draft-model <name>  speculative-decoding draft model
   --temperature <n>     sampling temperature
   --reasoning <lvl>     reasoning effort (low|medium|high)
-  --mode <ask|code>     agent mode (default: code)
+  --mode <ask|plan|code> agent mode (default: code)
   --dir <path>        project folder all tasks are based on
   --context <n>       --maxout <n>        --max-tokens <n>
   --max-steps <n>     tool-step cap (0 = unlimited; default)
   --intercept         approval gate before mutating tools run
-  --stream <on|off>   streaming model replies (default on); --no-stream = single JSON reply
   --system <prompt>   --no-tools / --tools  --save   --list   -h`;
 
 // ------------------------------------------------------------------ ui/color
@@ -819,7 +794,7 @@ function loadCfg() {
                 intercept: false, autoYes: false, maxSteps: 0,
                 blockedCommands: DEFAULT_BLOCKED,
                 draftModel: "", temperature: null,
-                reasoning: "", redact: true, mode: "code", stream: true };
+                reasoning: "", redact: true, mode: "code" };
   try { Object.assign(cfg, JSON.parse(fs.readFileSync(CFG_PATH, "utf8"))); } catch {}
   return cfg;
 }
@@ -832,6 +807,8 @@ const systemPrompt = (cfg, userPrompt = "") => {
   let s = "";
   if (cfg.mode === "ask") {
     s = "You are an expert AI assistant. The user is in ASK mode. Answer questions directly and conversationally. Do NOT use any tools, do NOT read or write files, and do NOT execute commands. Just provide helpful text responses.";
+  } else if (cfg.mode === "plan") {
+    s = "You are an expert autonomous software-engineering agent. The user is in PLAN mode. Your goal is to analyze the project and create a detailed, step-by-step plan to solve the user's task. You may use read-only tools (like read_file and shell for searching) to gather context, but DO NOT write, edit, or execute any mutating commands. Output a clear, actionable plan.";
   } else {
     s = cfg.system || SYS_PROMPT;
   }
@@ -1117,54 +1094,11 @@ function repairToolCalls(slots) {
 }
 
 // ------------------------------------------------------------------ streaming
-// cfg.stream === false → single JSON reply ("stream": false), otherwise SSE chunks.
-// Both modes yield the same events: {type:"thinking"} / {type:"delta"} / {type:"end", result}.
-// Pre-flight repair of the outgoing message list. Some chat templates (the one
-// behind this endpoint raises "No user query found in messages") reject payloads
-// where no *renderable* user turn survives — e.g. every user/tool message has a
-// null/empty content after trimming, or orphaned tool results dangle without
-// their assistant.tool_calls parent. Fix locally instead of eating a server 500.
-function sanitizePayloadMessages(messages) {
-  const out = [];
-  const callIds = new Set();
-  for (const m of messages) {
-    if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
-      // deep-ish copy so we never mutate history during send
-      const tc = m.tool_calls.filter(t => t?.id && t.function?.name);
-      tc.forEach(t => callIds.add(t.id));
-      const c = { ...m };
-      if (!tc.length) { delete c.tool_calls; if (c.content == null) c.content = ""; }
-      else c.tool_calls = tc;
-      out.push(c);
-    } else if (m.role === "tool") {
-      if (!callIds.has(m.tool_call_id)) continue;           // orphan → drop
-      out.push({ ...m, content: String(m.content ?? "") }); // content must be a string
-    } else if (m.role === "user") {
-      out.push({ ...m, content: typeof m.content === "string" ? m.content : String(m.content ?? "") });
-    } else if (m.role === "system") {
-      out.push({ ...m, content: String(m.content ?? "") });
-    } else {
-      out.push({ ...m });
-    }
-  }
-  // trailing assistant-with-tool_calls with no answers yet would also break the template
-  while (out.length && out[out.length - 1].role === "assistant" && out[out.length - 1].tool_calls) out.pop();
-  // guarantee at least one renderable user turn
-  if (!out.some(m => m.role === "user" && String(m.content || "").trim())) {
-    const lastAsst = [...out].reverse().find(m => m.role === "assistant" && String(m.content || "").trim());
-    out.push({ role: "user", content: lastAsst
-      ? "Continue from where you left off."
-      : "Hello." });
-  }
-  return out;
-}
-
 async function* streamChat(cfg, messages, tools, signal) {
-  const nonStream = cfg.stream === false;
-  const payload = { model: cfg.model, messages: sanitizePayloadMessages(messages), stream: !nonStream };
+  const payload = { model: cfg.model, messages, stream: true };
   if (tools?.length) payload.tools = tools;
   if (cfg.maxTokens) payload.max_tokens = cfg.maxTokens;
-  if (!nonStream && !cfg._noStreamOpts) payload.stream_options = { include_usage: true };
+  if (!cfg._noStreamOpts) payload.stream_options = { include_usage: true };
   if (cfg.draftModel) payload.draft_model = cfg.draftModel;
   if (typeof cfg.temperature === "number" && !isNaN(cfg.temperature)) payload.temperature = cfg.temperature;
   if (cfg.reasoning) payload.reasoning_effort = cfg.reasoning;
@@ -1175,7 +1109,7 @@ async function* streamChat(cfg, messages, tools, signal) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Accept: nonStream ? "application/json" : "text/event-stream",
+        Accept: "text/event-stream",
         ...(cfg.apiKey ? { Authorization: "Bearer " + cfg.apiKey } : {}),
       },
       body: JSON.stringify(payload),
@@ -1188,14 +1122,6 @@ async function* streamChat(cfg, messages, tools, signal) {
   if (!res.ok) throw new ApiError(`HTTP ${res.status} ${await errText(res)}`);
   if (!res.body) throw new ApiError("empty response body");
 
-  // Misbehaving server: asked for JSON but got SSE anyway — fall back to the SSE parser.
-  const ct = (res.headers.get("content-type") || "").toLowerCase();
-  if (nonStream && ct.includes("text/event-stream")) { yield* sseChatEvents(res); return; }
-  if (nonStream) { yield* jsonChatEvents(res); return; }
-  yield* sseChatEvents(res);
-}
-
-async function* sseChatEvents(res) {
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = "", content = "", thinking = "", finish = null, done = false, usage = null;
@@ -1250,35 +1176,6 @@ async function* sseChatEvents(res) {
   } };
 }
 
-// Non-streaming mode ("stream": false): one JSON body with the complete message.
-async function* jsonChatEvents(res) {
-  let j;
-  try {
-    j = JSON.parse(await res.text());
-  } catch (e) {
-    throw new ApiError("invalid JSON response body (non-stream mode)");
-  }
-  if (j.error) throw new ApiError(typeof j.error === "string" ? j.error : (j.error.message || JSON.stringify(j.error)));
-  const ch = j.choices?.[0] || {};
-  const m = ch.message || ch.delta || {};
-  const think = m.reasoning_content || m.reasoning || m.thinking || "";
-  if (think) yield { type: "thinking", text: think };
-  if (m.content) yield { type: "delta", text: m.content };
-  const tcs = [];
-  for (const tc of m.tool_calls || []) {
-    const a = tc.function?.arguments;
-    tcs.push({
-      id: tc.id || "", index: tc.index ?? null, name: tc.function?.name || "",
-      arguments: typeof a === "object" ? JSON.stringify(a) : (a || ""),
-    });
-  }
-  yield { type: "end", result: {
-    content: m.content || "", thinking: think,
-    finish: ch.finish_reason || null, usage: j.usage || null,
-    toolCalls: repairToolCalls(tcs),
-  } };
-}
-
 // ------------------------------------------------------------------ markdown-lite
 const INLINE = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)/g;
 class MDStream {
@@ -1316,7 +1213,6 @@ function truncate(s, cap) {
 function fmtCall(name, args) {
   if (name === "shell") return "$ " + String(args.command || args._raw || "");
   if (name === "read_file") {
-    if (Array.isArray(args.paths)) return `read ${args.paths.length} files: ${args.paths.join(", ")}`;
     let r = `read ${args.path || "?"}`;
     if (args.start || args.end) r += ` [${args.start || 1}-${args.end || "end"}]`;
     return r;
@@ -1378,22 +1274,7 @@ function runShell(cmd, timeoutSec, opts = {}, cfg = {}) {
   });
 }
 function toolRead(a, cfg) {
-  // `paths`: several files in ONE call — saves a round trip per file.
-  const many = Array.isArray(a.paths) ? a.paths.map(String).filter(Boolean) : [];
-  if (many.length) {
-    const cap = Math.max(2000, Math.floor((Number(cfg?.maxout) || 24000) / many.length));
-    const parts = [];
-    let allOk = true;
-    for (const p of many.slice(0, 12)) {
-      const [ok, txt] = toolRead({ path: p }, cfg);
-      if (!ok) allOk = false;
-      parts.push(`===== ${p} ${ok ? "" : "(FAILED)"} =====\n${ok ? txt.slice(0, cap) : txt}`);
-    }
-    if (many.length > 12) parts.push(`…and ${many.length - 12} more files not read (12 per call)`);
-    return [allOk, parts.join("\n\n")];
-  }
   const p = resolveP(a.path, cfg);
-  if (!String(a.path || "").trim()) return [false, "error: read_file needs `path` (one file) or `paths` (several)"];
   if (isProtectedPath(p)) return [false, `error: could not read file '${a.path}' (no such file)`];
   const fd = fs.openSync(p, "r");
   try {
@@ -1488,47 +1369,14 @@ async function runTool(name, args, cfg) {
 
 // ------------------------------------------------------------------ context mgmt / stats
 const estTokens = h => Math.max(1, Math.floor(JSON.stringify(h).length / 4));
-// Split history into groups that must stay together: an assistant message with
-// tool_calls is inseparable from the tool results that answer it.
-function historyGroups(h) {
-  const groups = [];
-  for (let i = 1; i < h.length; i++) {
-    const m = h[i];
-    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
-      const g = [m];
-      while (i + 1 < h.length && h[i + 1].role === "tool") g.push(h[++i]);
-      groups.push(g);
-    } else {
-      groups.push([m]);
-    }
-  }
-  return groups;
-}
 function trimHistory(h, cfg) {
   const cap = Number(cfg.context) || 0;
   if (!cap) return;
   const budget = cap - 1024 - (Number(cfg.maxTokens) || 0);
-  let guard = 0;
-  while (estTokens(h) > budget && h.length > 2 && guard++ < 500) {
-    // find the last group containing a real user message — everything before it
-    // is older conversation we may drop; that group and after must stay.
-    const groups = historyGroups(h);
-    let keepFrom = -1;
-    for (let gi = groups.length - 1; gi >= 0; gi--) {
-      if (groups[gi].some(m => m.role === "user")) { keepFrom = gi; break; }
-    }
-    if (keepFrom <= 0) break;                 // nothing droppable without killing the user turn
-    const victim = groups.slice(0, keepFrom).flat();
-    const before = JSON.stringify(h).length;
-    for (const v of victim) {
-      const idx = h.indexOf(v);
-      if (idx > 0) h.splice(idx, 1);
-    }
-    if (JSON.stringify(h).length === before) break;   // no progress — stop instead of looping
+  while (h.length > 2 && estTokens(h) > budget) {
+    h.splice(1, 1);
+    while (h.length > 1 && h[1].role === "tool") h.splice(1, 1);
   }
-  // final safety net: never leave orphaned tool results at the head/tail
-  while (h.length > 1 && h[1].role === "tool") h.splice(1, 1);
-  while (h.length > 1 && h[h.length - 1].role === "tool") h.pop();
 }
 const fmtK = n => {
   n = Number(n) || 0;
@@ -1780,22 +1628,13 @@ function stripToolMarkup(t) {
 }
 
 // ------------------------------------------------------------------ agent loop
-async function agentTurn(cfg, history, keys, userMsg = "") {
+async function agentTurn(cfg, history, keys) {
   if (cfg.tools) await ensureMcp();
   let tools = cfg.tools ? allTools() : [];
   if (cfg.mode === "ask") tools = [];
-  // Prefer the caller-supplied prompt; only fall back to scanning history.
-  // The scan must ignore assistant/tool messages and empty user rows so a
-  // mid-turn round trip can never mistake a tool result for "the ask".
-  let lastUserMsg = String(userMsg || "");
-  if (!lastUserMsg.trim()) {
-    lastUserMsg = [...history].reverse().find(m => m.role === "user" && String(m.content || "").trim())?.content || "";
-  }
-  const hasSystem = history[0]?.role === "system";
-  // Refreshed each round trip so usage stats see the current config. There is no mutable
-  // per-turn plan state any more, so the system prompt stays stable across the whole turn.
-  const refreshSystem = () => { if (hasSystem) history[0].content = systemPrompt(cfg, lastUserMsg); };
-  refreshSystem();
+  else if (cfg.mode === "plan") tools = tools.filter(t => ["read_file", "shell"].includes(t.function.name) || mcpRegistry.has(t.function.name));
+  const lastUserMsg = [...history].reverse().find(m => m.role === "user")?.content || "";
+  if (history[0]?.role === "system") history[0].content = systemPrompt(cfg, lastUserMsg);
 
   const limit = Number(cfg.maxSteps) || 0;
   let step = 0;
@@ -1813,7 +1652,6 @@ async function agentTurn(cfg, history, keys, userMsg = "") {
       console.log(dim(`… still working (${step} tool steps) — ctrl+c to stop`));
     }
 
-    refreshSystem();               // live goal + task state on every round trip
     trimHistory(history, cfg);
     const md = new MDStream();
     let shownThink = false, shownText = false, result = null;
@@ -1856,10 +1694,7 @@ async function agentTurn(cfg, history, keys, userMsg = "") {
               process.stdout.write(yellow("! usage reporting unsupported — retrying without it\n"));
               continue;
             }
-            // A 5xx whose body complains about the message list is a payload
-            // problem, not a transient one — retrying identically just loops.
-            const templateComplaint = /no user (query|message)|must contain at least one user|chat template/i.test(msg);
-            if (!templateComplaint && RETRYABLE(msg)) {
+            if (RETRYABLE(msg)) {
               process.stdout.write(yellow(`! ${msg} — retry ${attempts}/2 in ${attempts}s…\n`));
               await sleep(1000 * attempts);
               continue;
@@ -1876,16 +1711,6 @@ async function agentTurn(cfg, history, keys, userMsg = "") {
             if (/invalid tool call|tool call arguments|malformed tool/i.test(msg)) {
               sanitizeHistory(history);
               process.stdout.write(yellow("! repaired malformed tool-call history — retrying\n"));
-              continue;
-            }
-            // Server-side chat template complained there is no user turn in the
-            // payload. Re-send the real prompt as a fresh user message so the
-            // conversation always has one (history itself stays untouched).
-            if (/no user (query|message)/i.test(msg)) {
-              const lu = [...history].reverse().find(m => m.role === "user" && String(m.content || "").trim());
-              if (!lu) history.push({ role: "user", content: lastUserMsg || "Continue." });
-              else history.push({ role: "user", content: lu.content });
-              process.stdout.write(yellow("! endpoint lost the user turn — re-anchoring and retrying\n"));
               continue;
             }
             if (tools.length && step === 1 && /tool|function/i.test(msg)) {
@@ -1911,7 +1736,7 @@ async function agentTurn(cfg, history, keys, userMsg = "") {
         result.content = stripToolMarkup(result.content);
       }
     }
-    if (!tcs.length) { // final message → the turn is over (simple one-request/one-flow loop)
+    if (!tcs.length) { // final message → done (1 round trip)
       history.push({ role: "assistant", content: result.content || "" });
       if (result.usage) showStats(cfg, history, result.usage);
       return;
@@ -1951,9 +1776,7 @@ async function agentTurn(cfg, history, keys, userMsg = "") {
       type: "function",
       function: { name: t.name || "", arguments: t.arguments || "{}" },
     }));
-    // content must be a string (never null) — some chat templates treat a null
-    // content as "no user query" once the surrounding turns are rendered away.
-    history.push({ role: "assistant", content: result.content || "", tool_calls: entries });
+    history.push({ role: "assistant", content: result.content || null, tool_calls: entries });
 
     for (const e of entries) {
       let args; try { args = JSON.parse(e.function.arguments); } catch { args = { _raw: e.function.arguments }; }
@@ -2416,8 +2239,8 @@ async function handleCommand(line, cfg, history, keys) {
     }
     case "/mode": {
     const m = (k || "").toLowerCase();
-    if (!["code", "ask"].includes(m)) {
-      console.log(dim("usage: /mode <code|ask>"));
+    if (!["code", "ask", "plan"].includes(m)) {
+      console.log(dim("usage: /mode <code|ask|plan>"));
     } else {
       cfg.mode = m;
       saveCfg(cfg);
@@ -2440,12 +2263,12 @@ async function handleCommand(line, cfg, history, keys) {
       const masked = key.length > 12 ? key.slice(0, 7) + "…" + key.slice(-4) : (key ? "set" : "—");
       console.log(`  url      ${cfg.apiUrl}\n  model    ${cfg.model}\n  key      ${masked}` +
         `\n  draft    ${cfg.draftModel || "—"}\n  temp     ${cfg.temperature == null ? "default" : cfg.temperature}` +
-        `\n  reasoning ${cfg.reasoning || "default"}\n  mode     ${cfg.mode || "code"}` +
+        `\n  reasoning ${cfg.reasoning || "default"}
+        mode     ${cfg.mode || "code"}` +
         `\n  dir      ${cfg.projectDir ? displayPath(cfg.projectDir) : "(process cwd: " + displayPath(process.cwd()) + ")"}` +
         `\n  context  ${cfg.context || "not set (no trimming)"}\n  maxout   ${cfg.maxout}` +
         `   max_tokens ${cfg.maxTokens || "default"}\n  intercept ${cfg.intercept ? "on" : "off"}` +
         `\n  max_steps ${cfg.maxSteps || "unlimited"}\n  blocked  ${(cfg.blockedCommands || DEFAULT_BLOCKED).length} pattern(s)` +
-        `\n  stream   ${cfg.stream === false ? 'off ("stream": false, single JSON reply)' : "on (SSE chunks)"}` +
         `\n  mcp      ${mcpClients.size} server(s)\n  tools    ${cfg.tools ? "on" : "off"}` +
         `\n  data     ${DATA_DIR}`);
       break;
@@ -2465,11 +2288,11 @@ async function handleCommand(line, cfg, history, keys) {
         }
         else if (k === "mode") {
         const m = (v || "").toLowerCase();
-        if (["code", "ask"].includes(m)) {
+        if (["code", "ask", "plan"].includes(m)) {
           cfg.mode = m;
           if (history.length) history[0].content = systemPrompt(cfg);
         } else {
-          console.log(dim("usage: /set mode <code|ask>"));
+          console.log(dim("usage: /set mode <code|ask|plan>"));
           return true;
         }
         }
@@ -2498,18 +2321,9 @@ async function handleCommand(line, cfg, history, keys) {
           else if (["off","false","0","disable","disabled"].includes(t)) cfg.tools = false;
           else { console.log(dim("usage: /set tools <on|off>")); return true; }
         }
-        else if (k === "stream") {
-          const t = (v || "").toLowerCase();
-          if (["on","true","1","enable","enabled"].includes(t)) cfg.stream = true;
-          else if (["off","false","0","disable","disabled"].includes(t)) cfg.stream = false;
-          else { console.log(dim("usage: /set stream <on|off>")); return true; }
-          console.log(dim(cfg.stream
-            ? "  requests use stream:true — SSE chunks as they arrive"
-            : "  requests use stream:false — one JSON reply per model call"));
-        }
         else if (k === "max_steps") cfg.maxSteps = v ? parseInt(v, 10) : 0;
         else if (k === "system" && v) { cfg.system = v; if (history.length) history[0].content = systemPrompt(cfg); }
-        else { console.log(dim("usage: /set url|model|key|draft_model|temperature|reasoning|mode|redact|dir|context|max_tokens|maxout|intercept|tools|stream|max_steps|system <value>")); return true; }
+        else { console.log(dim("usage: /set url|model|key|draft_model|temperature|reasoning|mode|redact|dir|context|max_tokens|maxout|intercept|tools|max_steps|system <value>")); return true; }
         saveCfg(cfg);
         console.log(dim(`✓ ${k} updated`));
       } catch (e) { console.log(red(String(e.message))); }
@@ -2535,7 +2349,7 @@ async function handleCommand(line, cfg, history, keys) {
 function banner(cfg) {
   const dir = cfg.projectDir ? displayPath(cfg.projectDir) : displayPath(process.cwd());
   const modeStr = cfg.mode && cfg.mode !== "code" ? "  ·  mode " + cfg.mode : "";
-  console.log(bold("◆ ai-agent") + dim(`  ${cfg.model} @ ${cfg.apiUrl}  ·  ${osDescription()}  ·  ctx ${cfg.context ? fmtK(cfg.context) : "unknown"}  ·  key ${cfg.apiKey ? "✓" : "—"}` + (cfg.draftModel ? `  ·  draft ${cfg.draftModel}` : "") + (cfg.temperature != null ? `  ·  temp ${cfg.temperature}` : "") + (cfg.reasoning ? `  ·  reasoning ${cfg.reasoning}` : "") + (cfg.intercept ? "  ·  🔒 intercept" : "") + (cfg.stream === false ? "  ·  stream off" : "") + modeStr));
+  console.log(bold("◆ ai-agent") + dim(`  ${cfg.model} @ ${cfg.apiUrl}  ·  ${osDescription()}  ·  ctx ${cfg.context ? fmtK(cfg.context) : "unknown"}  ·  key ${cfg.apiKey ? "✓" : "—"}` + (cfg.draftModel ? `  ·  draft ${cfg.draftModel}` : "") + (cfg.temperature != null ? `  ·  temp ${cfg.temperature}` : "") + (cfg.reasoning ? `  ·  reasoning ${cfg.reasoning}` : "") + (cfg.intercept ? "  ·  🔒 intercept" : "") + modeStr));
   console.log(dim(`  📁 ${dir}   ·   data: ${DATA_DIR}`));
   console.log(dim("  enter send · shift+enter newline (or \\+enter) · @file+Tab complete · ^C cancel · ^D exit · /help"));
 }
@@ -2562,8 +2376,6 @@ function parseArgs(argv) {
       case "--intercept": case "-i": a.intercept = true; break;
       case "--no-tools": a.noTools = true; break;
       case "--tools": a.tools = true; break;
-      case "--stream": a.stream = next(); break;
-      case "--no-stream": a.noStream = true; break;
       case "--list": a.list = true; break;
       case "--save": a.save = true; break;
       case "-h": case "--help": a.help = true; break;
@@ -2579,22 +2391,11 @@ async function main() {
 
   initDataDir();
 
-  // Config precedence, highest first: CLI flags > env vars > $AITERM_HOME/.aiterm.json
-  // > ~/.aiterm/config.json > defaults.
-  // A stale user config must never silently override an explicit --url/--model:
-  // that was the source of mysterious "wrong endpoint" / retry-loop behavior.
   const cfg = loadCfg();
-  try { Object.assign(cfg, JSON.parse(fs.readFileSync(path.join(DATA_DIR, ".aiterm.json"), "utf8"))); } catch {}
-  // A per-project override file that exists but leaves a connection field empty
-  // (or null) must not shadow the global config value for it.
-  for (const k of ["apiUrl", "apiKey", "model", "context", "projectDir"]) {
-    if (!cfg[k]) delete cfg[k];
-  }
   cfg.apiUrl = process.env.AI_URL || process.env.OPENAI_BASE_URL || cfg.apiUrl;
   cfg.apiKey = process.env.AI_KEY || process.env.OPENAI_API_KEY || cfg.apiKey;
   cfg.model = process.env.AI_MODEL || cfg.model;
   cfg.projectDir = process.env.AI_DIR || cfg.projectDir;
-  if (process.env.AI_STREAM) cfg.stream = ["on","true","1"].includes(process.env.AI_STREAM.toLowerCase());
   if (args.url) cfg.apiUrl = args.url;
   if (args.model) cfg.model = args.model;
   if (args.key) cfg.apiKey = args.key;
@@ -2605,8 +2406,6 @@ async function main() {
   if (args.maxTokens) cfg.maxTokens = args.maxTokens;
   if (args.noTools) cfg.tools = false;
   if (args.tools) cfg.tools = true;
-  if (args.stream !== undefined) cfg.stream = ["on","true","1"].includes(String(args.stream).toLowerCase());
-  if (args.noStream) cfg.stream = false;
   if (args.intercept) cfg.intercept = true;
   if (args.maxSteps !== undefined) cfg.maxSteps = args.maxSteps;
   if (args.draftModel) cfg.draftModel = args.draftModel;
@@ -2630,7 +2429,7 @@ async function main() {
       catch (e) { console.error(red("✗ " + e.message)); process.exit(1); }
       if (!cfg.context) await autoContext(cfg, null);
       const h = [{ role: "system", content: systemPrompt(cfg, text) }, { role: "user", content: text }];
-      try { await agentTurn(cfg, h, {}, text); }
+      try { await agentTurn(cfg, h, {}); }
       catch (e) { console.error(red("✗ " + e.message)); process.exit(1); }
     }
     return;
@@ -2643,7 +2442,7 @@ async function main() {
 
   if (args.prompt) {
     const h = [{ role: "system", content: systemPrompt(cfg, args.prompt) }, { role: "user", content: args.prompt }];
-    try { await agentTurn(cfg, h, {}, args.prompt); }
+    try { await agentTurn(cfg, h, {}); }
     catch (e) { console.error(red("✗ " + e.message)); process.exit(1); }
     return;
   }
@@ -2670,7 +2469,7 @@ async function main() {
     const snap = history.length;
     history.push({ role: "user", content: t });
     try {
-      await agentTurn(cfg, history, keys, t);
+      await agentTurn(cfg, history, keys);
     } catch (e) {
       history.length = snap;
       console.error(red("✗ " + e.message));
