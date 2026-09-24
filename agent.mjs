@@ -3,12 +3,6 @@
  * ai-agent.mjs — minimal, fully-working, self-learning terminal AI agent.
  * Node >= 18, ZERO dependencies (stdlib only).
  *
- * v2.10.0 — v2.9.0 + loop detection:
- *   - Detects when the model repeats the same text output or tool calls
- *   - Catches exact repeats, cycling patterns (A-B-A-B), and dominated sequences
- *   - Stops gracefully with a message instead of burning tokens forever
- *   - Stronger system prompt rules against repetition
- *
  * v2.9.0 — v2.8.0 + fully SILENT secret redaction:
  *   - Real secrets are replaced with length-preserving dummy tokens (min 4 chars)
  *     in every tool result the model sees. No markers, no disclosure anywhere in
@@ -24,7 +18,7 @@
  * token/context usage, context auto-detect, str_replace, sessions,
  * @file autocomplete, OS command ledger, self-learning memory,
  * execution interception, command-policy blocklist, draft model,
- * temperature, reasoning level, /compact, loop detection.
+ * temperature, reasoning level, /compact.
  *
  * quick start:
  *   node ai-agent.mjs                                     # first-run setup wizard
@@ -43,7 +37,7 @@ import { exec, spawn } from "node:child_process";
 import process from "node:process";
 import { EventSource } from "eventsource";
 
-const VERSION = "2.10.0";
+const VERSION = "2.9.0";
 
 // ------------------------------------------------------------------ data folder
 const DATA_DIR = path.join(os.homedir(), ".aiterm");
@@ -110,7 +104,7 @@ const SYS_PROMPT =
   "6. OMITTED CONTENT: if context shows an omission marker (e.g. '...lines omitted...'), read the real content before editing; never pass the marker into an edit.\n" +
   "7. VALIDATE: after changes, run build/tests/linters via `shell` to confirm. Verify errors are actually fixed.\n" +
   "8. ERROR LIMIT: if the same fix fails repeatedly, STOP and explain the blocker + options to the user instead of looping.\n" +
-  "9. ITERATE WITHOUT REPEATING: after each tool call, continue from where you left off. NEVER repeat the same tool call with the same arguments. NEVER output the same text twice in a row. If you notice you're going in circles, STOP and explain what's happening.\n" +
+  "9. ITERATE WITHOUT REPEATING: after each tool call, continue from where you left off.\n" +
   "\n" +
   "SHELLS: use cmd-style commands; PowerShell is blocked. Use background=true for dev servers/watchers.\n" +
   "NO COMMENTS: never add filler/explanatory comments to code unless asked.\n" +
@@ -121,61 +115,6 @@ const SYS_PROMPT =
   "TOOLS: tool calls should be in json format not xml.";
 
 const MAX_FAIL_STREAK = 3;
-
-// ------------------------------------------------------------------ loop detection
-// Tracks recent assistant outputs and tool calls to detect repetition loops.
-const LOOP_WINDOW = 6;          // look at last N assistant turns
-const LOOP_CONTENT_THRESHOLD = 4; // N identical/similar content blocks → loop
-const LOOP_TOOL_THRESHOLD = 4;    // N identical tool calls → loop
-const LOOP_CYCLE_MIN = 2;         // min cycle length to detect repeating patterns
-const LOOP_CYCLE_MAX = 3;         // max cycle length to check
-
-function contentSignature(text) {
-  // Normalize whitespace and take a fingerprint (first 500 chars is enough to detect repetition)
-  return String(text || "").replace(/\s+/g, " ").trim().slice(0, 500);
-}
-
-function toolCallSignature(name, argsStr) {
-  // Normalize: sort JSON keys so {a:1,b:2} and {b:2,a:1} match
-  let normalized = argsStr || "{}";
-  try { normalized = JSON.stringify(JSON.parse(normalized), Object.keys(JSON.parse(normalized)).sort()); } catch {}
-  return `${name}(${normalized})`;
-}
-
-function detectLoop(recentSigs) {
-  if (recentSigs.length < LOOP_CONTENT_THRESHOLD) return null;
-
-  // 1. Exact repetition: the same thing N times in a row
-  const last = recentSigs[recentSigs.length - 1];
-  let exactCount = 0;
-  for (let i = recentSigs.length - 1; i >= 0; i--) {
-    if (recentSigs[i] === last) exactCount++;
-    else break;
-  }
-  if (exactCount >= LOOP_CONTENT_THRESHOLD) return `exact-repeat (${exactCount}x)`;
-
-  // 2. Cycle detection: A-B-A-B or A-B-C-A-B-C patterns
-  for (let cycleLen = LOOP_CYCLE_MIN; cycleLen <= LOOP_CYCLE_MAX; cycleLen++) {
-    if (recentSigs.length < cycleLen * 2) continue;
-    const tail = recentSigs.slice(-cycleLen * 2);
-    let isCycle = true;
-    for (let i = 0; i < cycleLen; i++) {
-      if (tail[i] !== tail[i + cycleLen]) { isCycle = false; break; }
-    }
-    if (isCycle) return `cycle (length ${cycleLen}, ${tail.length / cycleLen} repetitions)`;
-  }
-
-  // 3. High overlap: most of the last N are identical (e.g. 4 out of 6)
-  const freq = new Map();
-  for (const s of recentSigs) freq.set(s, (freq.get(s) || 0) + 1);
-  const maxFreq = Math.max(...freq.values());
-  if (maxFreq >= LOOP_CONTENT_THRESHOLD) {
-    const dominated = [...freq.entries()].find(([, v]) => v === maxFreq)?.[0];
-    if (dominated && dominated === last) return `dominated (${maxFreq}/${recentSigs.length} identical)`;
-  }
-
-  return null;
-}
 
 const TOOLS = [
   { type: "function", function: {
@@ -256,7 +195,6 @@ notes
   - data folder: ${DATA_DIR}  (config, mcp, memory, commands, sessions)
   - MCP servers: edit ${MCP_PATH}
   - the agent stops after ${MAX_FAIL_STREAK} consecutive tool failures to avoid damage
-  - loop detection: automatically stops if the model repeats the same output or tool calls
   - tools: shell, read_file, str_replace, write_file, remember, forget, + MCP tools
   - env vars: AI_URL / AI_MODEL / AI_KEY / AI_DIR
 `;
@@ -1639,8 +1577,6 @@ async function agentTurn(cfg, history, keys) {
   const limit = Number(cfg.maxSteps) || 0;
   let step = 0;
   let failStreak = 0;
-  const recentContentSigs = [];  // track assistant text output signatures
-  const recentToolSigs = [];     // track tool call signatures
   for (;;) {
     step++;
     if (limit > 0 && step > limit) {
@@ -1739,35 +1675,6 @@ async function agentTurn(cfg, history, keys) {
     if (!tcs.length) { // final message → done (1 round trip)
       history.push({ role: "assistant", content: result.content || "" });
       if (result.usage) showStats(cfg, history, result.usage);
-      return;
-    }
-
-    // --- loop detection: check if model is repeating itself ---
-    // Check content repetition
-    const contentSig = contentSignature(result.content);
-    if (contentSig) recentContentSigs.push(contentSig);
-    if (recentContentSigs.length > LOOP_WINDOW * 2) recentContentSigs.splice(0, recentContentSigs.length - LOOP_WINDOW * 2);
-    const contentLoop = detectLoop(recentContentSigs);
-    if (contentLoop) {
-      history.push({ role: "assistant", content:
-        `I detected a repetition loop in my own output (${contentLoop}) and stopped. ` +
-        "I appear to be generating the same response repeatedly without making progress. " +
-        "Please rephrase your request or break it into smaller steps." });
-      console.log(red(`! repetition loop detected in model output (${contentLoop}) — stopping`));
-      return;
-    }
-
-    // Check tool call repetition
-    const toolSigs = tcs.map(t => toolCallSignature(t.name, t.arguments));
-    for (const sig of toolSigs) recentToolSigs.push(sig);
-    if (recentToolSigs.length > LOOP_WINDOW * 3) recentToolSigs.splice(0, recentToolSigs.length - LOOP_WINDOW * 3);
-    const toolLoop = detectLoop(recentToolSigs);
-    if (toolLoop) {
-      history.push({ role: "assistant", content:
-        `I detected a repetition loop in my tool calls (${toolLoop}) and stopped. ` +
-        "I appear to be making the same tool calls repeatedly without making progress. " +
-        "Please rephrase your request, or tell me what specific outcome you need." });
-      console.log(red(`! repetition loop detected in tool calls (${toolLoop}) — stopping`));
       return;
     }
 
