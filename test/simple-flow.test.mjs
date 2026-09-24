@@ -24,7 +24,7 @@ function runAgent({ url, prompt, dir, home, extraArgs = [] }) {
       "--dir", dir,
       "--context", "8000",
       ...extraArgs,
-    ], { env: { ...process.env, HOME: home, NO_COLOR: "1" }, stdio: ["pipe", "pipe", "pipe"] });
+    ], { env: { ...process.env, HOME: home, USERPROFILE: home, AITERM_HOME: home, NO_COLOR: "1" }, stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
     child.stdout.on("data", c => (out += c));
     child.stderr.on("data", c => (out += c));
@@ -94,7 +94,7 @@ async function runRepl({ url, dir, home, lines, waitMs = 1200 }) {
   const { spawn } = await import("node:child_process");
   const cmd = `node ${AGENT} --url ${url} --model mock-model --key k --dir ${dir} --context 8000`;
   const child = spawn("script", ["-qec", cmd, "/dev/null"],
-    { env: { ...process.env, HOME: home, NO_COLOR: "1", TERM: "dumb" },
+    { env: { ...process.env, HOME: home, USERPROFILE: home, AITERM_HOME: home, NO_COLOR: "1", TERM: "dumb" },
       stdio: ["pipe", "pipe", "pipe"] });
   let out = "";
   child.stdout.on("data", c => (out += c));
@@ -120,7 +120,9 @@ test({ name: "removed plan commands report as unknown instead of crashing",
                                   lines: ["/plan", "/plan clear", "/set autoplan off", "/mode plan"] });
     // the planning commands are gone
     assert.match(plain, /unknown command '\/plan'/);
-    assert.match(plain, /unknown command '\/plan clear'/);
+    // "/plan clear" is also gone; the REPL reports it as unknown '/plan' (never a task list)
+    assert.equal((plain.match(/unknown command '\/plan'/g) || []).length, 2);
+    assert.doesNotMatch(plain, /tasks?\b|follow-up|NOT DONE/i);
     // /set autoplan now falls through to the generic /set usage line (no autoplan key)
     assert.match(plain, /usage: \/set/);
     assert.doesNotMatch(plain, /autoplan updated|auto-planning/i);
@@ -142,7 +144,7 @@ test("--autoplan flags are gone; --mode only accepts ask|code", async () => {
     // unknown flags fall through to being treated as the prompt — so just check USAGE
     const help = await new Promise((resolve) => {
       const child = spawn(process.execPath, [AGENT, "--help"],
-                          { env: { ...process.env, HOME: home, NO_COLOR: "1" } });
+                          { env: { ...process.env, HOME: home, USERPROFILE: home, AITERM_HOME: home, NO_COLOR: "1" } });
       let out = "";
       child.stdout.on("data", c => (out += c));
       child.stderr.on("data", c => (out += c));

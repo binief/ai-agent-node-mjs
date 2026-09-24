@@ -61,7 +61,10 @@ import { EventSource } from "eventsource";
 const VERSION = "2.13.0";
 
 // ------------------------------------------------------------------ data folder
-const DATA_DIR = path.join(os.homedir(), ".aiterm");
+// AITERM_HOME lets tests (and power users) relocate the whole data folder.
+// os.homedir() ignores HOME on POSIX, so pinning env.HOME in a child process is
+// not enough to isolate ~/.aiterm — this explicit override is the reliable way.
+const DATA_DIR = path.join(process.env.AITERM_HOME || os.homedir(), ".aiterm");
 const CFG_PATH = path.join(DATA_DIR, "config.json");
 const MCP_PATH = path.join(DATA_DIR, "mcp.json");
 const MEM_PATH = path.join(DATA_DIR, "memory.json");
@@ -1116,9 +1119,49 @@ function repairToolCalls(slots) {
 // ------------------------------------------------------------------ streaming
 // cfg.stream === false → single JSON reply ("stream": false), otherwise SSE chunks.
 // Both modes yield the same events: {type:"thinking"} / {type:"delta"} / {type:"end", result}.
+// Pre-flight repair of the outgoing message list. Some chat templates (the one
+// behind this endpoint raises "No user query found in messages") reject payloads
+// where no *renderable* user turn survives — e.g. every user/tool message has a
+// null/empty content after trimming, or orphaned tool results dangle without
+// their assistant.tool_calls parent. Fix locally instead of eating a server 500.
+function sanitizePayloadMessages(messages) {
+  const out = [];
+  const callIds = new Set();
+  for (const m of messages) {
+    if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
+      // deep-ish copy so we never mutate history during send
+      const tc = m.tool_calls.filter(t => t?.id && t.function?.name);
+      tc.forEach(t => callIds.add(t.id));
+      const c = { ...m };
+      if (!tc.length) { delete c.tool_calls; if (c.content == null) c.content = ""; }
+      else c.tool_calls = tc;
+      out.push(c);
+    } else if (m.role === "tool") {
+      if (!callIds.has(m.tool_call_id)) continue;           // orphan → drop
+      out.push({ ...m, content: String(m.content ?? "") }); // content must be a string
+    } else if (m.role === "user") {
+      out.push({ ...m, content: typeof m.content === "string" ? m.content : String(m.content ?? "") });
+    } else if (m.role === "system") {
+      out.push({ ...m, content: String(m.content ?? "") });
+    } else {
+      out.push({ ...m });
+    }
+  }
+  // trailing assistant-with-tool_calls with no answers yet would also break the template
+  while (out.length && out[out.length - 1].role === "assistant" && out[out.length - 1].tool_calls) out.pop();
+  // guarantee at least one renderable user turn
+  if (!out.some(m => m.role === "user" && String(m.content || "").trim())) {
+    const lastAsst = [...out].reverse().find(m => m.role === "assistant" && String(m.content || "").trim());
+    out.push({ role: "user", content: lastAsst
+      ? "Continue from where you left off."
+      : "Hello." });
+  }
+  return out;
+}
+
 async function* streamChat(cfg, messages, tools, signal) {
   const nonStream = cfg.stream === false;
-  const payload = { model: cfg.model, messages, stream: !nonStream };
+  const payload = { model: cfg.model, messages: sanitizePayloadMessages(messages), stream: !nonStream };
   if (tools?.length) payload.tools = tools;
   if (cfg.maxTokens) payload.max_tokens = cfg.maxTokens;
   if (!nonStream && !cfg._noStreamOpts) payload.stream_options = { include_usage: true };
@@ -1445,14 +1488,47 @@ async function runTool(name, args, cfg) {
 
 // ------------------------------------------------------------------ context mgmt / stats
 const estTokens = h => Math.max(1, Math.floor(JSON.stringify(h).length / 4));
+// Split history into groups that must stay together: an assistant message with
+// tool_calls is inseparable from the tool results that answer it.
+function historyGroups(h) {
+  const groups = [];
+  for (let i = 1; i < h.length; i++) {
+    const m = h[i];
+    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      const g = [m];
+      while (i + 1 < h.length && h[i + 1].role === "tool") g.push(h[++i]);
+      groups.push(g);
+    } else {
+      groups.push([m]);
+    }
+  }
+  return groups;
+}
 function trimHistory(h, cfg) {
   const cap = Number(cfg.context) || 0;
   if (!cap) return;
   const budget = cap - 1024 - (Number(cfg.maxTokens) || 0);
-  while (h.length > 2 && estTokens(h) > budget) {
-    h.splice(1, 1);
-    while (h.length > 1 && h[1].role === "tool") h.splice(1, 1);
+  let guard = 0;
+  while (estTokens(h) > budget && h.length > 2 && guard++ < 500) {
+    // find the last group containing a real user message — everything before it
+    // is older conversation we may drop; that group and after must stay.
+    const groups = historyGroups(h);
+    let keepFrom = -1;
+    for (let gi = groups.length - 1; gi >= 0; gi--) {
+      if (groups[gi].some(m => m.role === "user")) { keepFrom = gi; break; }
+    }
+    if (keepFrom <= 0) break;                 // nothing droppable without killing the user turn
+    const victim = groups.slice(0, keepFrom).flat();
+    const before = JSON.stringify(h).length;
+    for (const v of victim) {
+      const idx = h.indexOf(v);
+      if (idx > 0) h.splice(idx, 1);
+    }
+    if (JSON.stringify(h).length === before) break;   // no progress — stop instead of looping
   }
+  // final safety net: never leave orphaned tool results at the head/tail
+  while (h.length > 1 && h[1].role === "tool") h.splice(1, 1);
+  while (h.length > 1 && h[h.length - 1].role === "tool") h.pop();
 }
 const fmtK = n => {
   n = Number(n) || 0;
@@ -1704,11 +1780,17 @@ function stripToolMarkup(t) {
 }
 
 // ------------------------------------------------------------------ agent loop
-async function agentTurn(cfg, history, keys) {
+async function agentTurn(cfg, history, keys, userMsg = "") {
   if (cfg.tools) await ensureMcp();
   let tools = cfg.tools ? allTools() : [];
   if (cfg.mode === "ask") tools = [];
-  const lastUserMsg = [...history].reverse().find(m => m.role === "user")?.content || "";
+  // Prefer the caller-supplied prompt; only fall back to scanning history.
+  // The scan must ignore assistant/tool messages and empty user rows so a
+  // mid-turn round trip can never mistake a tool result for "the ask".
+  let lastUserMsg = String(userMsg || "");
+  if (!lastUserMsg.trim()) {
+    lastUserMsg = [...history].reverse().find(m => m.role === "user" && String(m.content || "").trim())?.content || "";
+  }
   const hasSystem = history[0]?.role === "system";
   // Refreshed each round trip so usage stats see the current config. There is no mutable
   // per-turn plan state any more, so the system prompt stays stable across the whole turn.
@@ -1774,7 +1856,10 @@ async function agentTurn(cfg, history, keys) {
               process.stdout.write(yellow("! usage reporting unsupported — retrying without it\n"));
               continue;
             }
-            if (RETRYABLE(msg)) {
+            // A 5xx whose body complains about the message list is a payload
+            // problem, not a transient one — retrying identically just loops.
+            const templateComplaint = /no user (query|message)|must contain at least one user|chat template/i.test(msg);
+            if (!templateComplaint && RETRYABLE(msg)) {
               process.stdout.write(yellow(`! ${msg} — retry ${attempts}/2 in ${attempts}s…\n`));
               await sleep(1000 * attempts);
               continue;
@@ -1791,6 +1876,16 @@ async function agentTurn(cfg, history, keys) {
             if (/invalid tool call|tool call arguments|malformed tool/i.test(msg)) {
               sanitizeHistory(history);
               process.stdout.write(yellow("! repaired malformed tool-call history — retrying\n"));
+              continue;
+            }
+            // Server-side chat template complained there is no user turn in the
+            // payload. Re-send the real prompt as a fresh user message so the
+            // conversation always has one (history itself stays untouched).
+            if (/no user (query|message)/i.test(msg)) {
+              const lu = [...history].reverse().find(m => m.role === "user" && String(m.content || "").trim());
+              if (!lu) history.push({ role: "user", content: lastUserMsg || "Continue." });
+              else history.push({ role: "user", content: lu.content });
+              process.stdout.write(yellow("! endpoint lost the user turn — re-anchoring and retrying\n"));
               continue;
             }
             if (tools.length && step === 1 && /tool|function/i.test(msg)) {
@@ -1856,7 +1951,9 @@ async function agentTurn(cfg, history, keys) {
       type: "function",
       function: { name: t.name || "", arguments: t.arguments || "{}" },
     }));
-    history.push({ role: "assistant", content: result.content || null, tool_calls: entries });
+    // content must be a string (never null) — some chat templates treat a null
+    // content as "no user query" once the surrounding turns are rendered away.
+    history.push({ role: "assistant", content: result.content || "", tool_calls: entries });
 
     for (const e of entries) {
       let args; try { args = JSON.parse(e.function.arguments); } catch { args = { _raw: e.function.arguments }; }
@@ -2482,7 +2579,17 @@ async function main() {
 
   initDataDir();
 
+  // Config precedence, highest first: CLI flags > env vars > $AITERM_HOME/.aiterm.json
+  // > ~/.aiterm/config.json > defaults.
+  // A stale user config must never silently override an explicit --url/--model:
+  // that was the source of mysterious "wrong endpoint" / retry-loop behavior.
   const cfg = loadCfg();
+  try { Object.assign(cfg, JSON.parse(fs.readFileSync(path.join(DATA_DIR, ".aiterm.json"), "utf8"))); } catch {}
+  // A per-project override file that exists but leaves a connection field empty
+  // (or null) must not shadow the global config value for it.
+  for (const k of ["apiUrl", "apiKey", "model", "context", "projectDir"]) {
+    if (!cfg[k]) delete cfg[k];
+  }
   cfg.apiUrl = process.env.AI_URL || process.env.OPENAI_BASE_URL || cfg.apiUrl;
   cfg.apiKey = process.env.AI_KEY || process.env.OPENAI_API_KEY || cfg.apiKey;
   cfg.model = process.env.AI_MODEL || cfg.model;
@@ -2523,7 +2630,7 @@ async function main() {
       catch (e) { console.error(red("✗ " + e.message)); process.exit(1); }
       if (!cfg.context) await autoContext(cfg, null);
       const h = [{ role: "system", content: systemPrompt(cfg, text) }, { role: "user", content: text }];
-      try { await agentTurn(cfg, h, {}); }
+      try { await agentTurn(cfg, h, {}, text); }
       catch (e) { console.error(red("✗ " + e.message)); process.exit(1); }
     }
     return;
@@ -2536,7 +2643,7 @@ async function main() {
 
   if (args.prompt) {
     const h = [{ role: "system", content: systemPrompt(cfg, args.prompt) }, { role: "user", content: args.prompt }];
-    try { await agentTurn(cfg, h, {}); }
+    try { await agentTurn(cfg, h, {}, args.prompt); }
     catch (e) { console.error(red("✗ " + e.message)); process.exit(1); }
     return;
   }
@@ -2563,7 +2670,7 @@ async function main() {
     const snap = history.length;
     history.push({ role: "user", content: t });
     try {
-      await agentTurn(cfg, history, keys);
+      await agentTurn(cfg, history, keys, t);
     } catch (e) {
       history.length = snap;
       console.error(red("✗ " + e.message));
