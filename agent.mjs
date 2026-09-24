@@ -3,6 +3,16 @@
  * ai-agent.mjs — minimal, fully-working, self-learning terminal AI agent.
  * Node >= 18, ZERO dependencies (stdlib only).
  *
+ * v2.9.1 — fix llama-server/Ollama/LM-Studio + Qwen HTTP 500
+ *   "No user query found in messages.":
+ *   - trimHistory() no longer deletes the user turn: it drops oldest
+ *     assistant/tool groups first, always keeps the most recent user message
+ *     (the anchor Qwen's Jinja guard requires), compresses old tool outputs
+ *     in place as a last resort, and never orphans tool messages.
+ *   - Jinja/chat-template 500s are detected and fail fast with an actionable
+ *     hint instead of being retried like transient errors.
+ *   - send-boundary seatbelt re-anchors a user turn if history ever has none.
+ *
  * v2.9.0 — v2.8.0 + fully SILENT secret redaction:
  *   - Real secrets are replaced with length-preserving dummy tokens (min 4 chars)
  *     in every tool result the model sees. No markers, no disclosure anywhere in
@@ -32,12 +42,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import readline from "node:readline/promises";
 import { exec, spawn } from "node:child_process";
 import process from "node:process";
 import { EventSource } from "eventsource";
 
-const VERSION = "2.9.0";
+const VERSION = "2.9.1";
 
 // ------------------------------------------------------------------ data folder
 const DATA_DIR = path.join(os.homedir(), ".aiterm");
@@ -223,6 +234,13 @@ class ApiError extends Error {}
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const tryParse = s => { try { return JSON.parse(s); } catch { return undefined; } };
 const RETRYABLE = msg => /HTTP (429|5\d\d)|ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|fetch failed|network|socket hang|overloaded|rate.?limit|temporar|unavailable/i.test(msg);
+// Qwen-family chat templates (llama-server, Ollama, LM Studio, vLLM) answer
+// HTTP 500 when a request contains no plain `role:"user"` turn
+// ("No user query found in messages"). That is a deterministic template
+// rejection, NOT a transient 5xx — retrying is pointless (it never reaches
+// the GPU), so detect it and fail fast with an actionable hint instead.
+const isTemplateError = msg =>
+  /no user query found|error rendering prompt|jinja|chat.?template|raise_exception|templateerror/i.test(String(msg || ""));
 
 const expandUser = p => (p.startsWith("~") ? path.join(os.homedir(), p.slice(1)) : p);
 const displayPath = p => {
@@ -1307,14 +1325,84 @@ async function runTool(name, args, cfg) {
 
 // ------------------------------------------------------------------ context mgmt / stats
 const estTokens = h => Math.max(1, Math.floor(JSON.stringify(h).length / 4));
+function hasPlainUser(h) {
+  for (const m of h) {
+    if (!m || m.role !== "user") continue;
+    const c = String(m.content ?? "").trim();
+    // Qwen templates treat <tool_response>-wrapped user turns as tool results,
+    // not queries — only a plain user turn satisfies the template guard.
+    if (c && !(c.startsWith("<tool_response>") && c.endsWith("</tool_response>"))) return true;
+  }
+  return false;
+}
+// Last-line defence at the send boundary: Qwen-family templates HTTP-500 any
+// request without a plain user turn, so re-anchor one rather than send a
+// request that can never succeed.
+function ensureUserAnchor(h, lastUserMsg) {
+  if (hasPlainUser(h)) return;
+  const q = String(lastUserMsg || "");
+  h.push({ role: "user", content:
+    (q && q.length < 2000) ? q :
+    "[System note: earlier history was trimmed to fit the context window. Continue the task using the remaining context.]" });
+  console.log(yellow("! history had no user turn left (trimmed?) — re-anchored so Qwen-style templates accept the request"));
+}
 function trimHistory(h, cfg) {
   const cap = Number(cfg.context) || 0;
-  if (!cap) return;
+  if (!cap || h.length <= 2) return;
   const budget = cap - 1024 - (Number(cfg.maxTokens) || 0);
-  while (h.length > 2 && estTokens(h) > budget) {
-    h.splice(1, 1);
-    while (h.length > 1 && h[1].role === "tool") h.splice(1, 1);
+  if (estTokens(h) <= budget) return;
+
+  const findAnchor = () => {
+    for (let i = h.length - 1; i >= 0; i--)
+      if (h[i] && h[i].role === "user") return i;
+    return -1;
+  };
+
+  // Drop oldest groups first. An assistant message that issued tool calls plus
+  // its following tool results is one atomic group (tools are never orphaned).
+  // Index 0 (system) and the most recent user turn (the anchor Qwen-style
+  // templates require — see "No user query found in messages") are protected.
+  let dropped = 0, guard = 0;
+  while (h.length > 2 && estTokens(h) > budget && guard++ < 500) {
+    const anchor = findAnchor();
+    let gi = -1, gj = -1;
+    for (let i = 1; i < h.length; i++) {
+      if (i === anchor) continue;
+      let j = i + 1;
+      const m = h[i];
+      if (m && m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+        while (j < h.length && j !== anchor && h[j] && h[j].role === "tool") j++;
+      }
+      gi = i; gj = j;
+      break;
+    }
+    if (gi < 0) break; // only protected messages left
+    dropped += gj - gi;
+    h.splice(gi, gj - gi);
   }
+
+  // Still over budget with only protected messages left (e.g. one giant tool
+  // result): compress old tool outputs in place instead of dropping the anchor.
+  let squeezed = 0;
+  guard = 0;
+  while (h.length > 1 && estTokens(h) > budget && guard++ < 100) {
+    const anchor = findAnchor();
+    let bi = -1, blen = 0;
+    for (let i = 1; i < h.length; i++) {
+      if (i === anchor) continue;
+      const c = h[i] && h[i].role === "tool" ? String(h[i].content || "") : "";
+      if (c.length > blen) { blen = c.length; bi = i; }
+    }
+    if (bi < 0 || blen <= 600) break;
+    h[bi].content = truncate(h[bi].content, 600);
+    squeezed++;
+  }
+  if (dropped || squeezed)
+    console.log(dim(`context trim: dropped ${dropped} old message(s)` +
+      (squeezed ? `, compressed ${squeezed} tool output(s)` : "") +
+      ` to fit ${cap} tokens (user turn preserved)`));
+
+  sanitizeHistory(h);
 }
 const fmtK = n => {
   n = Number(n) || 0;
@@ -1600,6 +1688,7 @@ async function agentTurn(cfg, history, keys) {
         spin.start(step === 1 ? "thinking…" : "continuing…");
         let firstVisible = true;
         try {
+          ensureUserAnchor(history, lastUserMsg);
           for await (const ev of streamChat(cfg, history, tools, ac.signal)) {
             if (firstVisible && (ev.type === "thinking" || ev.type === "delta")) {
               spin.stop(); firstVisible = false;
@@ -1625,6 +1714,12 @@ async function agentTurn(cfg, history, keys) {
           const msg = String(e?.message || e);
           const gotOutput = shownThink || shownText;
           if (!gotOutput && attempts < 3) {
+            if (isTemplateError(msg)) {
+              throw new ApiError(msg +
+                "\n  hint: the server's chat template rejected this request because it has no plain user message " +
+                "('No user query found in messages'). Qwen + llama-server/Ollama/LM Studio are strict about this. " +
+                "Try /compact or /clear, raise /set context, or lower /set maxout.");
+            }
             if (/stream_options|include_usage/i.test(msg)) {
               cfg._noStreamOpts = true;
               process.stdout.write(yellow("! usage reporting unsupported — retrying without it\n"));
@@ -2386,4 +2481,12 @@ async function main() {
   console.log(dim("bye"));
 }
 
-main().catch(e => { console.error(red("fatal: " + (e.stack || e.message))); process.exit(1); });
+const _isMain = (() => {
+  try {
+    return !!process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch { return false; }
+})();
+if (_isMain) main().catch(e => { console.error(red("fatal: " + (e.stack || e.message))); process.exit(1); });
+
+// Exported for automated tests (importing this module has no side effects).
+export { trimHistory, sanitizeHistory, hasPlainUser, ensureUserAnchor, isTemplateError, estTokens, truncate };
